@@ -1,6 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
 from app.core.database import get_db
 
 router = APIRouter(prefix="/rail", tags=["Rail Allocation & Schedules"])
@@ -10,7 +9,7 @@ class RailAllocateRequest(BaseModel):
 
 @router.post("/allocate")
 def allocate_rail_capacity(payload: RailAllocateRequest):
-    """Triggers `sp_allocate_rail_capacity` stored procedure to split cargo across train trips."""
+    # Triggers sp_allocate_rail_capacity stored procedure to split cargo across train trips
     with get_db() as conn:
         with conn.cursor() as cursor:
             # Call procedure with OUT parameter
@@ -29,14 +28,20 @@ def allocate_rail_capacity(payload: RailAllocateRequest):
             
             conn.commit()
             
-            # Fetch allocation breakdown for presentation
-            cursor.execute("""
-                SELECT ota.allocation_id, ota.order_id, tt.trip_code, tt.departure_time, ota.allocated_quantity, ota.allocated_space
-                FROM order_trip_allocations ota
-                JOIN train_trips tt ON ota.trip_id = tt.trip_id
-                WHERE ota.order_id = %s
-            """, (payload.order_id,))
+            # Fetch allocation breakdown for presentation joining with order_item
+            cursor.execute('''
+                SELECT ra.allocation_id, oi.order_id, tt.trip_id, tt.departure_datetime, ra.allocated_quantity, ra.allocated_space
+                FROM rail_allocation ra
+                JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                JOIN train_trip tt ON ra.trip_id = tt.trip_id
+                WHERE oi.order_id = %s
+            ''', (payload.order_id,))
             allocations = cursor.fetchall()
+            
+            # Format date to string for JSON serialization
+            for alloc in allocations:
+                if alloc.get('departure_datetime'):
+                    alloc['departure_datetime'] = alloc['departure_datetime'].strftime("%Y-%m-%d %H:%M:%S")
             
             return {
                 "order_id": payload.order_id,
@@ -46,14 +51,27 @@ def allocate_rail_capacity(payload: RailAllocateRequest):
 
 @router.get("/schedules")
 def get_train_schedules():
-    """Lists scheduled train trips from Kandy to regional hubs."""
+    # Lists scheduled train trips with dynamically calculated remaining capacity
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT trip_id, trip_code, origin_hub, destination_hub, departure_time, arrival_time,
-                       total_capacity_cubic_m, remaining_capacity_cubic_m, status
-                FROM train_trips
-                ORDER BY departure_time ASC
-            """)
+            cursor.execute('''
+                SELECT tt.trip_id, 
+                       ss1.city AS origin_city, 
+                       ss2.city AS destination_city, 
+                       tt.departure_datetime, 
+                       tt.arrival_datetime,
+                       tt.total_capacity, 
+                       (tt.total_capacity - COALESCE((SELECT SUM(allocated_space) FROM rail_allocation WHERE trip_id = tt.trip_id), 0)) AS remaining_capacity, 
+                       tt.status
+                FROM train_trip tt
+                JOIN station_store ss1 ON tt.origin_station_id = ss1.station_id
+                JOIN station_store ss2 ON tt.destination_station_id = ss2.station_id
+                ORDER BY tt.departure_datetime ASC
+            ''')
             trips = cursor.fetchall()
+            for trip in trips:
+                if trip.get('departure_datetime'):
+                    trip['departure_datetime'] = trip['departure_datetime'].strftime("%Y-%m-%d %H:%M:%S")
+                if trip.get('arrival_datetime'):
+                    trip['arrival_datetime'] = trip['arrival_datetime'].strftime("%Y-%m-%d %H:%M:%S")
             return {"trips": trips}

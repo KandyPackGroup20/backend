@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from datetime import datetime
 from app.core.database import get_db
 
 router = APIRouter(prefix="/roster", tags=["Fleet Roster & Driver Assignment"])
@@ -17,12 +16,12 @@ class RosterAssignRequest(BaseModel):
 
 @router.post("/assign")
 def assign_roster(payload: RosterAssignRequest):
-    """Triggers `sp_assign_truck_roster` procedure enforcing Checks A, B, C, D atomically with row locking."""
+    # Triggers sp_assign_truck_roster procedure enforcing Checks A, B, C, D atomically with row locking
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
+            cursor.execute('''
                 CALL sp_assign_truck_roster(%s, %s, %s, %s, %s, %s, %s, %s, @result_code);
-            """, (
+            ''', (
                 payload.route_id,
                 payload.truck_id,
                 payload.driver_id,
@@ -50,13 +49,13 @@ def assign_roster(payload: RosterAssignRequest):
             conn.commit()
             return {
                 "status": "SUCCESS",
-                "message": "Roster assignment created successfully and driver/assistant accumulators updated.",
+                "message": "Roster assignment created successfully.",
                 "result_code": result_code
             }
 
 @router.get("/candidates")
 def get_roster_candidates():
-    """Fetches candidate drivers and assistants using DB Views."""
+    # Fetches candidate drivers, assistants, and trucks using DB Views
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT * FROM v_available_drivers")
@@ -65,7 +64,7 @@ def get_roster_candidates():
             cursor.execute("SELECT * FROM v_available_assistants")
             assistants = cursor.fetchall()
             
-            cursor.execute("SELECT * FROM trucks WHERE status = 'AVAILABLE'")
+            cursor.execute("SELECT truck_id, plate_number, capacity FROM truck WHERE is_active = 1")
             trucks = cursor.fetchall()
             
             return {

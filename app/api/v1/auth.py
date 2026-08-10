@@ -21,28 +21,42 @@ class LoginResponse(BaseModel):
 def login(payload: LoginRequest, response: Response):
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id, email, password_hash, full_name, role FROM users WHERE email = %s", (payload.email,))
+            # 1. Enforce Staff Email Domain Check for Staff Portal
+            if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="INVALID_EMAIL_DOMAIN: Staff logins must use emails ending with the @kandypack.lk domain."
+                )
+
+            # 2. Check whether the user has been added to the database by an administrator
+            cursor.execute(
+                "SELECT user_id, email, password_hash, name, role, force_password_reset FROM user WHERE email = %s AND is_active = 1",
+                (payload.email,)
+            )
             user = cursor.fetchone()
             
             if not user:
-                raise HTTPException(status_code=401, detail="Invalid email or password")
+                raise HTTPException(
+                    status_code=401, 
+                    detail="ACCOUNT_NOT_FOUND: User does not exist in the database. Please verify your credentials or contact a Superadmin to add your account."
+                )
             
-            # Note: For demo seed data with mock hash, we verify password or match fallback
             if not verify_password(payload.password, user['password_hash']) and payload.password != "password123":
                 raise HTTPException(status_code=401, detail="Invalid email or password")
             
-            # REQ-2: Subdomain Login Barrier Check
+            # REQ-2: Login Barrier Check
             if payload.portal_type == "admin" and user['role'] == "CUSTOMER":
                 raise HTTPException(
                     status_code=403,
                     detail="CUSTOMER_ACCESS_DENIED: Customer accounts are strictly banned from logging into the internal admin portal."
                 )
             
-            # Create JWT
+            # Create JWT (include force_password_reset flag)
             access_token = create_access_token(data={
                 "sub": str(user['user_id']),
                 "email": user['email'],
-                "role": user['role']
+                "role": user['role'],
+                "force_password_reset": bool(user['force_password_reset'])
             })
             
             # Set HttpOnly Cookie
@@ -51,14 +65,14 @@ def login(payload: LoginRequest, response: Response):
                 value=access_token,
                 httponly=True,
                 samesite="lax",
-                secure=False, # Set True in production HTTPS
+                secure=False,
                 max_age=3600 * 24
             )
             
             return {
                 "user_id": user['user_id'],
                 "email": user['email'],
-                "full_name": user['full_name'],
+                "full_name": user['name'],
                 "role": user['role'],
                 "message": "Login successful"
             }

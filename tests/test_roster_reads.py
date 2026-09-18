@@ -276,15 +276,15 @@ class RosterReadsTests(unittest.TestCase):
                     self.assertEqual(connect.call_count, 2)
                     fixtures.assert_not_called()
 
-    def test_mysql_guarded_requests_and_disabled_write_do_not_connect(self):
+    def test_mysql_guarded_requests_and_invalid_write_do_not_connect(self):
         with patch.dict(os.environ, {"ROSTER_DATA_MODE": "mysql"}):
             with patch("pymysql.connect", side_effect=AssertionError("Guarded request connected")) as connect:
                 self.assertEqual(self.get(headers=self.auth("CUSTOMER")).status_code, 403)
                 self.assertEqual(self.get(headers=self.auth(force_reset=True)).status_code, 403)
                 self.assertEqual(self.client.get(PREFIX + "/candidates").status_code, 401)
+                # Session 2 enables MySQL writes; malformed input is rejected before database access.
                 response = self.client.post(PREFIX + "/assign", headers=self.auth(), json={})
-                self.assertEqual(response.status_code, 503)
-                self.assertEqual(response.json()["detail"]["error_code"], "ROSTER_ASSIGNMENT_NOT_IMPLEMENTED")
+                self.assertEqual(response.status_code, 422)
                 connect.assert_not_called()
 
     def test_mysql_unrepresentable_query_bounds_are_input_errors(self):

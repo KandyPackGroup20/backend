@@ -140,3 +140,43 @@ class AssignmentCreatedResponse(FrozenModel):
     result_code: Literal["ROSTER_ASSIGNED", "ROSTER_ASSIGNMENT_REPLAYED"]
     assignment: Assignment
     meta: MySQLWriteMeta = MySQLWriteMeta()
+
+
+class StaffHours(FrozenModel):
+    staff_id: PositiveInt
+    staff_type: Literal["DRIVER", "ASSISTANT"]
+    scheduled_seconds: int = Field(ge=0)
+    limit_seconds: PositiveInt
+    remaining_seconds: int
+
+
+class HoursResponse(FrozenModel):
+    week_start: date
+    week_end: date
+    hours: tuple[StaffHours, ...]
+    meta: MySQLWriteMeta = MySQLWriteMeta()
+
+
+class AuditAttempt(FrozenModel):
+    audit_id: PositiveInt
+    actor_id: PositiveInt
+    actor_name: str | None
+    attempted_route_id: PositiveInt | None
+    attempted_truck_id: PositiveInt | None
+    attempted_driver_id: PositiveInt | None
+    attempted_assistant_id: PositiveInt | None
+    attempted_start_time: AwareDatetime | None
+    attempted_end_time: AwareDatetime | None
+    attempted_duration_seconds: int | None = Field(default=None, ge=0)
+    outcome: str = Field(min_length=1)
+    reason_code: str | None
+    policy_id: str | None
+    request_key: str | None
+    assignment_id: PositiveInt | None
+    occurred_at: AwareDatetime | None
+    legacy: bool
+
+
+class AuditResponse(FrozenModel):
+    attempts: tuple[AuditAttempt, ...]
+    meta: MySQLWriteMeta = MySQLWriteMeta()

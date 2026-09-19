@@ -6,7 +6,7 @@ Asia/Colombo requires system IANA timezone data (or tzdata on Windows).
 """
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,7 +21,8 @@ from app.roster.repository import (
     AssignmentOperationResult, RosterBusinessRejection, RosterDataError, RosterWindowError,
 )
 from app.roster.schemas import (
-    Assignment, AssignmentsResponse, CandidatesResponse, MySQLMeta, Route, Staff, Truck,
+    Assignment, AssignmentsResponse, AuditAttempt, AuditResponse, CandidatesResponse,
+    HoursResponse, MySQLMeta, MySQLWriteMeta, Route, Staff, StaffHours, Truck,
 )
 
 
@@ -49,6 +50,40 @@ ASSIGNMENTS_SQL = """
     WHERE (start_time < %s AND end_time > %s)
        OR start_time IS NULL OR end_time IS NULL OR end_time <= start_time
     ORDER BY start_time, roster_id
+"""
+HOURS_SQL = """
+    SELECT staff_id, duty_type,
+           SUM(TIMESTAMPDIFF(
+               SECOND, GREATEST(start_time, %s), LEAST(end_time, %s)
+           )) AS scheduled_seconds,
+           MAX(CASE WHEN is_counted IS NULL THEN 1 ELSE 0 END) AS invalid_status
+    FROM v_roster_duty_intervals
+    WHERE start_time < %s AND end_time > %s
+      AND (is_counted = 1 OR is_counted IS NULL)
+    GROUP BY staff_id, duty_type
+    ORDER BY staff_id, duty_type
+"""
+AUDIT_SQL = """
+    SELECT audit.audit_id, audit.user_id AS actor_id, actor.name AS actor_name,
+           audit.outcome AS base_outcome, audit.occurred_at,
+           detail.audit_id AS detail_audit_id, detail.request_key,
+           detail.roster_id AS assignment_id,
+           detail.route_id AS attempted_route_id,
+           detail.truck_id AS attempted_truck_id,
+           detail.driver_id AS attempted_driver_id,
+           detail.assistant_id AS attempted_assistant_id,
+           detail.start_time AS attempted_start_time,
+           detail.end_time AS attempted_end_time,
+           detail.duration_seconds AS attempted_duration_seconds,
+           detail.policy_id, detail.outcome AS detail_outcome,
+           detail.reason_code
+    FROM audit_log AS audit
+    LEFT JOIN roster_assignment_audit_detail AS detail
+        ON detail.audit_id = audit.audit_id
+    LEFT JOIN `user` AS actor ON actor.user_id = audit.user_id
+    WHERE audit.entity_name = %s OR detail.audit_id IS NOT NULL
+    ORDER BY audit.occurred_at DESC, audit.audit_id DESC
+    LIMIT %s
 """
 
 DUPLICATE_REQUEST_SQL = """
@@ -140,10 +175,30 @@ def _positive_integer(value) -> int:
     return result
 
 
+def _nonnegative_integer(value) -> int:
+    if type(value) is int:
+        result = value
+    elif isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        result = int(value)
+    else:
+        raise _invalid()
+    if not 0 <= result <= 9007199254740991:
+        raise _invalid()
+    return result
+
+
+def _optional_positive_integer(value) -> int | None:
+    return None if value is None else _positive_integer(value)
+
+
 def _text(value) -> str:
     if not isinstance(value, str) or not value.strip():
         raise _invalid()
     return value
+
+
+def _optional_text(value) -> str | None:
+    return None if value is None else _text(value)
 
 
 def _colombo() -> ZoneInfo:
@@ -167,6 +222,10 @@ def _stored_datetime(value, zone: ZoneInfo) -> datetime:
             or aware.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) != value):
         raise _invalid()
     return aware
+
+
+def _optional_stored_datetime(value, zone: ZoneInfo) -> datetime | None:
+    return None if value is None else _stored_datetime(value, zone)
 
 
 def _database_error(exc: pymysql.MySQLError) -> RosterDataError:
@@ -200,6 +259,64 @@ def _assignment(row: dict, zone: ZoneInfo) -> Assignment:
         )},
         start_time=begin, end_time=finish, duration_seconds=seconds,
         status=row["status"], created_at=_stored_datetime(row["created_at"], zone),
+    )
+
+
+def _audit_attempt(row: dict, zone: ZoneInfo) -> AuditAttempt:
+    legacy = row["detail_audit_id"] is None
+    base_outcome = _text(row["base_outcome"])
+
+    if legacy:
+        return AuditAttempt(
+            audit_id=_positive_integer(row["audit_id"]),
+            actor_id=_positive_integer(row["actor_id"]),
+            actor_name=_optional_text(row["actor_name"]),
+            attempted_route_id=None,
+            attempted_truck_id=None,
+            attempted_driver_id=None,
+            attempted_assistant_id=None,
+            attempted_start_time=None,
+            attempted_end_time=None,
+            attempted_duration_seconds=None,
+            outcome=base_outcome,
+            reason_code=None,
+            policy_id=None,
+            request_key=None,
+            assignment_id=None,
+            occurred_at=_optional_stored_datetime(row["occurred_at"], zone),
+            legacy=True,
+        )
+
+    detail_outcome = row["detail_outcome"]
+    if detail_outcome not in {"ACCEPTED", "REJECTED"} or detail_outcome != base_outcome:
+        raise _invalid()
+    assignment_id = _optional_positive_integer(row["assignment_id"])
+    reason_code = _optional_text(row["reason_code"])
+    if ((detail_outcome == "ACCEPTED" and (assignment_id is None or reason_code is not None))
+            or (detail_outcome == "REJECTED" and (assignment_id is not None or reason_code is None))):
+        raise _invalid()
+    attempted_start = _stored_datetime(row["attempted_start_time"], zone)
+    attempted_end = _stored_datetime(row["attempted_end_time"], zone)
+    if attempted_end.astimezone(timezone.utc) <= attempted_start.astimezone(timezone.utc):
+        raise _invalid()
+    return AuditAttempt(
+        audit_id=_positive_integer(row["audit_id"]),
+        actor_id=_positive_integer(row["actor_id"]),
+        actor_name=_optional_text(row["actor_name"]),
+        attempted_route_id=_positive_integer(row["attempted_route_id"]),
+        attempted_truck_id=_positive_integer(row["attempted_truck_id"]),
+        attempted_driver_id=_positive_integer(row["attempted_driver_id"]),
+        attempted_assistant_id=_positive_integer(row["attempted_assistant_id"]),
+        attempted_start_time=attempted_start,
+        attempted_end_time=attempted_end,
+        attempted_duration_seconds=_nonnegative_integer(row["attempted_duration_seconds"]),
+        outcome=detail_outcome,
+        reason_code=reason_code,
+        policy_id=_text(row["policy_id"]),
+        request_key=_text(row["request_key"]),
+        assignment_id=assignment_id,
+        occurred_at=_optional_stored_datetime(row["occurred_at"], zone),
+        legacy=False,
     )
 
 
@@ -271,6 +388,51 @@ class MySQLRosterAdapter:
             cursor.execute(ASSIGNMENTS_SQL, (local_end, local_start))
             assignments = [_assignment(row, zone) for row in cursor.fetchall()]
             return AssignmentsResponse(assignments=tuple(assignments), meta=MySQLMeta())
+
+    def hours(self, week_start: date) -> HoursResponse:
+        _colombo()
+        if type(week_start) is not date or week_start.year < 1000 or week_start.weekday() != 0:
+            raise RosterWindowError("week_start must be a supported Monday in Asia/Colombo.")
+        try:
+            week_end = week_start + timedelta(days=7)
+            local_start = datetime.combine(week_start, time.min)
+            local_end = datetime.combine(week_end, time.min)
+        except (OverflowError, ValueError) as exc:
+            raise RosterWindowError("week_start is outside the supported MySQL date range.") from exc
+
+        with _snapshot() as cursor:
+            cursor.execute(HOURS_SQL, (local_start, local_end, local_end, local_start))
+            hours = []
+            for row in cursor.fetchall():
+                if _nonnegative_integer(row["invalid_status"]):
+                    raise _invalid()
+                staff_type = row["duty_type"]
+                if staff_type == "DRIVER":
+                    limit = 144000
+                elif staff_type == "ASSISTANT":
+                    limit = 216000
+                else:
+                    raise _invalid()
+                scheduled = _nonnegative_integer(row["scheduled_seconds"])
+                hours.append(StaffHours(
+                    staff_id=_positive_integer(row["staff_id"]),
+                    staff_type=staff_type,
+                    scheduled_seconds=scheduled,
+                    limit_seconds=limit,
+                    remaining_seconds=limit - scheduled,
+                ))
+            return HoursResponse(
+                week_start=week_start, week_end=week_end, hours=tuple(hours), meta=MySQLWriteMeta(),
+            )
+
+    def audit(self, limit: int) -> AuditResponse:
+        zone = _colombo()
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise RosterWindowError("Audit limit must be an integer from 1 through 100.")
+        with _snapshot() as cursor:
+            cursor.execute(AUDIT_SQL, ("roster_assignment", limit))
+            attempts = tuple(_audit_attempt(row, zone) for row in cursor.fetchall())
+            return AuditResponse(attempts=attempts, meta=MySQLWriteMeta())
 
     def assign(
         self, proposal: AssignmentProposal, *, actor_id: int, request_key: str,

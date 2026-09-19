@@ -1,7 +1,8 @@
 """Authenticated roster reads and durable MySQL assignment creation."""
 
 import logging
-from datetime import datetime
+import re
+from datetime import date, datetime, timedelta
 from typing import Annotated
 from uuid import uuid4
 
@@ -12,13 +13,18 @@ from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.roster.dependencies import (
-    get_roster_assignment_repository, get_roster_repository, require_roster_reader, require_roster_writer,
+    get_roster_assignment_repository, get_roster_reporting_repository, get_roster_repository,
+    require_roster_reader, require_roster_writer,
 )
 from app.roster.mysql_adapter import MySQLRosterAdapter
 from app.roster.policy import AssignmentProposal
-from app.roster.repository import RosterBusinessRejection, RosterDataError, RosterRepository, RosterWindowError
+from app.roster.repository import (
+    RosterBusinessRejection, RosterDataError, RosterReportingRepository, RosterRepository,
+    RosterWindowError,
+)
 from app.roster.schemas import (
-    AssignmentCreatedResponse, AssignmentRequest, AssignmentsResponse, CandidatesResponse, parse_instant,
+    AssignmentCreatedResponse, AssignmentRequest, AssignmentsResponse, AuditResponse,
+    CandidatesResponse, HoursResponse, parse_instant,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +70,24 @@ def assignment_window(
         ) from exc
 
 
+def selected_week(week_start: Annotated[str, Query()]) -> date:
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", week_start) is None:
+            raise ValueError("week_start must use YYYY-MM-DD format.")
+        result = date.fromisoformat(week_start)
+        if result.year < 1000:
+            raise ValueError("week_start is outside the supported MySQL date range.")
+        if result.weekday() != 0:
+            raise ValueError("week_start must be a Monday in Asia/Colombo.")
+        result + timedelta(days=7)
+        return result
+    except (OverflowError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "INVALID_ROSTER_WEEK", "message": str(exc)},
+        ) from exc
+
+
 @router.get("/candidates", response_model=CandidatesResponse)
 def get_roster_candidates(
     current_user: dict = Depends(require_roster_reader),
@@ -97,6 +121,58 @@ def get_roster_assignments(
         raise HTTPException(status_code=503, detail={"error_code": exc.error_code, "message": exc.message}) from exc
     except Exception as exc:
         logger.exception("Roster assignment read failed")
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "ROSTER_DATA_UNAVAILABLE", "message": "Roster data is unavailable. Retry later."},
+        ) from exc
+
+
+@router.get("/hours", response_model=HoursResponse)
+def get_roster_hours(
+    current_user: dict = Depends(require_roster_reader),
+    week_start: date = Depends(selected_week),
+    repository: RosterReportingRepository = Depends(get_roster_reporting_repository),
+):
+    try:
+        return repository.hours(week_start)
+    except RosterWindowError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "INVALID_ROSTER_WEEK", "message": str(exc)},
+        ) from exc
+    except RosterDataError as exc:
+        logger.error("Roster hours read failed: %s", exc.error_code)
+        raise HTTPException(
+            status_code=503, detail={"error_code": exc.error_code, "message": exc.message},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Roster hours read failed")
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "ROSTER_DATA_UNAVAILABLE", "message": "Roster data is unavailable. Retry later."},
+        ) from exc
+
+
+@router.get("/audit", response_model=AuditResponse)
+def get_roster_audit(
+    current_user: dict = Depends(require_roster_reader),
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    repository: RosterReportingRepository = Depends(get_roster_reporting_repository),
+):
+    try:
+        return repository.audit(limit)
+    except RosterWindowError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "INVALID_ROSTER_AUDIT_LIMIT", "message": str(exc)},
+        ) from exc
+    except RosterDataError as exc:
+        logger.error("Roster audit read failed: %s", exc.error_code)
+        raise HTTPException(
+            status_code=503, detail={"error_code": exc.error_code, "message": exc.message},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Roster audit read failed")
         raise HTTPException(
             status_code=503,
             detail={"error_code": "ROSTER_DATA_UNAVAILABLE", "message": "Roster data is unavailable. Retry later."},

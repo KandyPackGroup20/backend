@@ -1,5 +1,3 @@
-"""Focused HTTP contract checks for the Session 2C roster assignment route."""
-
 import unittest
 from datetime import datetime, timedelta, timezone
 

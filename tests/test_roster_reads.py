@@ -217,8 +217,11 @@ class RosterReadsTests(unittest.TestCase):
         for role in ("LOGISTICS_MGR", "CUSTOMER"):
             self.assertEqual(self.client.post(PREFIX + "/assign", headers=self.auth(role), json={}).status_code, 403)
         self.assertEqual(self.get("/assignments", params=WEEK).json(), before)
-        self.assertEqual(self.get("/hours").status_code, 404)
-        self.assertEqual(self.get("/audit").status_code, 404)
+        for path in ("/hours?week_start=2026-09-14", "/audit"):
+            response = self.get(path)
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["detail"]["error_code"], "ROSTER_REPORTING_REQUIRES_MYSQL")
+            self.assert_no_store(response)
 
     def test_roster_paths_never_attempt_a_mysql_connection(self):
         # The application database helper uses pymysql.connect. A regression to

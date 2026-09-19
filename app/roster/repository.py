@@ -1,12 +1,14 @@
 """Small data-access boundary independent of SQL, HTTP, and business policy."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Protocol
 
 from dataclasses import dataclass
 
 from app.roster.policy import AssignmentProposal
-from app.roster.schemas import Assignment, AssignmentsResponse, CandidatesResponse
+from app.roster.schemas import (
+    Assignment, AssignmentsResponse, AuditResponse, CandidatesResponse, HoursResponse,
+)
 
 
 class RosterDataError(Exception):
@@ -47,3 +49,11 @@ class RosterRepository(Protocol):
     def assign(
         self, proposal: AssignmentProposal, *, actor_id: int, request_key: str,
     ) -> AssignmentOperationResult: ...
+
+
+class RosterReportingRepository(Protocol):
+    """Persistent selected-week and attempt-history reads."""
+
+    def hours(self, week_start: date) -> HoursResponse: ...
+
+    def audit(self, limit: int) -> AuditResponse: ...

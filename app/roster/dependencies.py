@@ -10,7 +10,7 @@ from app.core.security import require_roles
 from app.roster.dev_adapter import DevelopmentRosterAdapter
 from app.roster.fixtures import make_fixtures
 from app.roster.mysql_adapter import MySQLRosterAdapter
-from app.roster.repository import RosterRepository
+from app.roster.repository import RosterReportingRepository, RosterRepository
 
 logger = logging.getLogger(__name__)
 _adapter: RosterRepository | None = None
@@ -91,5 +91,27 @@ def get_roster_assignment_repository() -> MySQLRosterAdapter:
         detail={
             "error_code": "ROSTER_ASSIGNMENT_NOT_IMPLEMENTED",
             "message": "Assignment creation requires ROSTER_DATA_MODE=mysql.",
+        },
+    )
+
+
+def get_roster_reporting_repository() -> RosterReportingRepository:
+    """Session 3A reports are database-backed and never synthesize durable history."""
+    if os.environ.get("ROSTER_DATA_MODE") == "mysql":
+        return MySQLRosterAdapter()
+    if (os.environ.get("APP_ENV") == "development"
+            and os.environ.get("ROSTER_DATA_MODE") == "dev-memory"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "ROSTER_REPORTING_REQUIRES_MYSQL",
+                "message": "Selected-week and persistent audit reporting require ROSTER_DATA_MODE=mysql.",
+            },
+        )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error_code": "ROSTER_DATA_DISABLED",
+            "message": "Select ROSTER_DATA_MODE=mysql for persistent roster reporting.",
         },
     )

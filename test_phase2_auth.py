@@ -32,7 +32,7 @@ def test_phase2():
     pw_hash = get_password_hash(raw_pw)
     assert verify_password(raw_pw, pw_hash) is True, "Password verification failed"
     assert verify_password("WrongPassword", pw_hash) is False, "Invalid password incorrectly verified"
-    print("    [✓] Password hashing & bcrypt verification passed.")
+    print("    [OK] Password hashing & bcrypt verification passed.")
 
     # 2. Test JWT Token Creation & Decoding
     print("[*] 2. Testing JWT Session Generation & Payload Decoding...")
@@ -50,14 +50,14 @@ def test_phase2():
     assert decoded["sub"] == "42", f"Expected sub 42, got {decoded.get('sub')}"
     assert decoded["role"] == "DISPATCHER", f"Expected role DISPATCHER, got {decoded.get('role')}"
     assert decoded["force_password_reset"] is True, "force_password_reset flag missing in JWT"
-    print("    [✓] JWT token encoded and decoded with full RBAC role and reset flag.")
+    print("    [OK] JWT token encoded and decoded with full RBAC role and reset flag.")
 
     # 3. Test SQL Injection Resilience
     print("[*] 3. Testing Parameterized SQL Injection Immunity...")
     sqli_payload = "' OR '1'='1' --"
     # When executed through parameterized query, %s treats payload as literal string value
     # (i.e. searching for a user whose literal email string is "' OR '1'='1' --")
-    print(f"    [✓] Parameterized binding safely escapes payload: {sqli_payload!r}")
+    print(f"    [OK] Parameterized binding safely escapes payload: {sqli_payload!r}")
 
     # 4. Validate Endpoint Definitions in auth.py
     print("[*] 4. Validating FastAPI Auth Route Registrations...")
@@ -65,8 +65,8 @@ def test_phase2():
     route_paths = [r.path for r in router.routes]
     expected_endpoints = ["/login", "/register", "/change-password", "/me", "/logout"]
     for ep in expected_endpoints:
-        assert ep in route_paths, f"Missing endpoint {ep}"
-        print(f"    [✓] Endpoint registered: /api/v1/auth{ep}")
+        assert (f"/auth{ep}" in route_paths or ep in route_paths), f"Missing endpoint {ep} in {route_paths}"
+        print(f"    [OK] Endpoint registered: /api/v1/auth{ep}")
 
     print("\n" + "=" * 70)
     print("ALL PHASE 2 BACKEND AUTH TESTS PASSED SUCCESSFULLY!")

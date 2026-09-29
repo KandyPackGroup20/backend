@@ -66,7 +66,7 @@ class HoursApiTests(unittest.TestCase):
         self.assertEqual(self.repository.hours_calls, [date(2026, 9, 14)])
         self.assertEqual(response.json()["week_end"], "2026-09-21")
         self.assertEqual(response.json()["meta"], {
-            "data_source": "mysql", "policy_id": "demo-v1", "policy_confirmed": False,
+            "data_source": "mysql", "policy_id": "kandypack-roster", "policy_confirmed": False,
             "timezone": "Asia/Colombo", "volatile": False, "fixture_week_start": None,
         })
         self.assertEqual(response.headers.get("cache-control"), "no-store")

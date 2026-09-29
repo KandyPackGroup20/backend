@@ -1,8 +1,6 @@
-"""Pure, replaceable provisional roster policy for the ``demo-v1`` rules.
+"""Apply the provisional demo roster rules.
 
-This module has no HTTP, database, or mutation dependency. The Session 2B
-repository invokes it after acquiring database locks; routes, clients, and
-repository code must not reimplement these calculations.
+This module contains the calculations used to check roster assignments.
 """
 
 from dataclasses import dataclass
@@ -48,12 +46,12 @@ class PolicyStaff:
 
 @dataclass(frozen=True)
 class PolicyRoster:
-    """All facts needed to make a deterministic policy decision.
+    """The information needed to make a consistent roster policy decision.
 
-    ``staff`` is a staff directory, not the active candidate list: callers must
-    include known historical staff records where available so person-level rules
-    also apply across staff records. Unknown historical IDs still compare by ID
-    rather than being discarded.
+    ``staff`` contains staff records used to check assignment rules. Include
+    known staff records even if they are not currently available for assignment,
+    so the rules can detect conflicts involving past records. If a staff record
+    is missing, its ID is still used for comparisons.
     """
 
     routes: tuple[Route, ...]
@@ -138,7 +136,7 @@ def _active(assignments: Iterable[Assignment]) -> tuple[Assignment, ...]:
 class DemoV1RosterPolicy:
     """The documented provisional touching-chain and Colombo-week rules."""
 
-    policy_id = "demo-v1"
+    policy_id = "kandypack-roster"
 
     def validate(self, roster: PolicyRoster, proposal: AssignmentProposal) -> PolicyValidationResult:
         route_by_id = {route.route_id: route for route in roster.routes}

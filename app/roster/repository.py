@@ -24,8 +24,15 @@ class RosterWindowError(ValueError):
     """An input window cannot be represented by the selected storage adapter."""
 
 
+class RosterIdempotencyConflict(Exception):
+    """A committed key belongs to a different request; never expose its facts."""
+
+    error_code = "IDEMPOTENCY_KEY_CONFLICT"
+    message = "Idempotency-Key was already used for a different assignment request."
+
+
 class RosterBusinessRejection(Exception):
-    """A policy decision that was durably audited and made no business change."""
+    """A transient policy rejection that made no business or audit change."""
 
     def __init__(self, error_code: str, message: str):
         super().__init__(message)
@@ -52,7 +59,7 @@ class RosterRepository(Protocol):
 
 
 class RosterReportingRepository(Protocol):
-    """Persistent selected-week and attempt-history reads."""
+    """Persistent selected-week and accepted-assignment audit reads."""
 
     def hours(self, week_start: date) -> HoursResponse: ...
 

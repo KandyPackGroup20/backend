@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from app.api.v1.roster import router
 from app.core.security import create_access_token
 from app.roster.dependencies import get_roster_assignment_repository
-from app.roster.repository import AssignmentOperationResult, RosterBusinessRejection, RosterDataError
+from app.roster.repository import AssignmentOperationResult, RosterBusinessRejection, RosterDataError, RosterIdempotencyConflict
 from app.roster.schemas import Assignment
 
 
@@ -134,3 +134,30 @@ class RosterAssignmentApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["result_code"], "ROSTER_ASSIGNMENT_REPLAYED")
         self.assertEqual(len(self.repository.calls), 1)
+
+
+    def test_key_conflict_is_409_without_stored_request_details(self):
+        self.repository.error = RosterIdempotencyConflict()
+        response = self.post({**self.auth(), "Idempotency-Key": "same-request"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], {
+            "error_code": "IDEMPOTENCY_KEY_CONFLICT",
+            "message": RosterIdempotencyConflict.message,
+        })
+        self.assert_no_store(response)
+
+    def test_invalid_intervals_are_rejected_before_attempt_auditing(self):
+        cases = (
+            {"end_time": PAYLOAD["start_time"]},
+            {"end_time": "2026-09-22T08:00:00+05:30"},
+            {"start_time": "not-a-time"},
+            {"start_time": "2026-09-22T09:00:00"},
+            {"start_time": "2026-09-22T09:00:00.001+05:30"},
+            {"start_time": "0999-09-22T09:00:00+05:30"},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                response = self.post(payload=PAYLOAD | changes)
+                self.assertEqual(response.status_code, 422)
+                self.assert_no_store(response)
+        self.assertEqual(self.repository.calls, [])

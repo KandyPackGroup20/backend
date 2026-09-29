@@ -28,7 +28,7 @@ def api_attempt(audit_id=3):
         attempted_start_time=datetime(2026, 9, 22, 9, tzinfo=timezone(zone)),
         attempted_end_time=datetime(2026, 9, 22, 10, tzinfo=timezone(zone)),
         attempted_duration_seconds=3600, outcome="ACCEPTED", reason_code=None,
-        policy_id="demo-v1", request_key=f"request-{audit_id}", assignment_id=501,
+        policy_id=None, request_key=f"request-{audit_id}", assignment_id=501,
         occurred_at=datetime(2026, 9, 20, 8, tzinfo=timezone(zone)), legacy=False,
     )
 
@@ -72,7 +72,7 @@ class AuditApiTests(unittest.TestCase):
         self.assertEqual((default.status_code, maximum.status_code), (200, 200))
         self.assertEqual(self.repository.audit_calls, [50, 100])
         self.assertEqual(default.headers.get("cache-control"), "no-store")
-        self.assertEqual(default.json()["meta"]["policy_id"], "demo-v1")
+        self.assertEqual(default.json()["meta"]["policy_id"], "kandypack-roster")
 
     def test_zero_over_maximum_and_non_integer_limits_are_rejected(self):
         for value in (0, -1, 101, "1.5", "many"):
@@ -107,34 +107,18 @@ class AuditApiTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"]["error_code"], "ROSTER_DATABASE_ACCESS_DENIED")
 
 
-def audit_row(
-    audit_id, occurred_at, *, outcome="ACCEPTED", detail=True, reason=None,
-    assignment_id=501, request_key=None,
-):
-    row = {
+def audit_row(audit_id, occurred_at, *, outcome="ACCEPTED", assignment_id=501):
+    return {
         "audit_id": audit_id, "actor_id": 777, "actor_name": "Dispatcher",
-        "base_outcome": outcome, "occurred_at": occurred_at,
-        "detail_audit_id": audit_id if detail else None,
-        "request_key": request_key or f"request-{audit_id}",
-        "assignment_id": assignment_id,
+        "outcome": outcome, "occurred_at": occurred_at,
+        "entity_name": "roster_assignment", "entity_id": assignment_id,
+        "request_key": f"request-{audit_id}", "assignment_id": assignment_id,
+        "linked_roster_id": assignment_id, "assignment_dispatcher_id": 777,
         "attempted_route_id": 11, "attempted_truck_id": 21,
         "attempted_driver_id": 31, "attempted_assistant_id": 32,
         "attempted_start_time": datetime(2026, 9, 22, 9),
         "attempted_end_time": datetime(2026, 9, 22, 10),
-        "attempted_duration_seconds": 3600,
-        "policy_id": "demo-v1", "detail_outcome": outcome,
-        "reason_code": reason,
     }
-    if not detail:
-        row.update({
-            "request_key": None, "assignment_id": None,
-            "attempted_route_id": None, "attempted_truck_id": None,
-            "attempted_driver_id": None, "attempted_assistant_id": None,
-            "attempted_start_time": None, "attempted_end_time": None,
-            "attempted_duration_seconds": None, "policy_id": None,
-            "detail_outcome": None, "reason_code": None,
-        })
-    return row
 
 
 class AuditCursor:
@@ -208,21 +192,18 @@ class MySQLAuditTests(unittest.TestCase):
         self.assertTrue(cursor.closed)
         self.assertTrue(connection.closed)
 
-    def test_accepted_rejected_and_legacy_records_preserve_only_stored_details(self):
-        rows = (
-            audit_row(1, datetime(2026, 9, 20, 8), detail=False, outcome="FAILURE"),
-            audit_row(2, datetime(2026, 9, 20, 9), outcome="REJECTED", reason="TRUCK_OVERLAP", assignment_id=None),
-            audit_row(3, datetime(2026, 9, 20, 10), outcome="ACCEPTED", assignment_id=503),
-        )
+    def test_accepted_records_join_request_facts_and_derive_duration(self):
+        rows = (audit_row(2, datetime(2026, 9, 20, 9)),
+                audit_row(3, datetime(2026, 9, 20, 10), assignment_id=503))
         response, _, _ = self.run_audit(rows)
-        accepted, rejected, legacy = response.attempts
-        self.assertEqual([accepted.audit_id, rejected.audit_id, legacy.audit_id], [3, 2, 1])
-        self.assertEqual((accepted.outcome, accepted.assignment_id, accepted.request_key), ("ACCEPTED", 503, "request-3"))
-        self.assertEqual((rejected.outcome, rejected.reason_code, rejected.assignment_id), ("REJECTED", "TRUCK_OVERLAP", None))
-        self.assertTrue(legacy.legacy)
-        self.assertEqual(legacy.outcome, "FAILURE")
-        self.assertEqual((legacy.request_key, legacy.policy_id, legacy.assignment_id), (None, None, None))
-        self.assertIsNone(legacy.attempted_route_id)
+        accepted = response.attempts[0]
+        self.assertEqual([row.audit_id for row in response.attempts], [3, 2])
+        self.assertEqual((accepted.outcome, accepted.assignment_id, accepted.request_key),
+                         ("ACCEPTED", 503, "request-3"))
+        self.assertEqual(accepted.attempted_duration_seconds, 3600)
+        self.assertIsNone(accepted.reason_code)
+        self.assertIsNone(accepted.policy_id)
+        self.assertFalse(accepted.legacy)
 
     def test_newest_first_uses_audit_id_as_deterministic_tie_breaker(self):
         same_time = datetime(2026, 9, 20, 10)
@@ -234,15 +215,31 @@ class MySQLAuditTests(unittest.TestCase):
         self.assertEqual([row.audit_id for row in response.attempts], [10, 9])
         self.assertIn("ORDER BY audit.occurred_at DESC, audit.audit_id DESC", mysql.AUDIT_SQL)
         params = next(params for sql, params in cursor.executions if sql == mysql.AUDIT_SQL)
-        self.assertEqual(params, ("roster_assignment", 2))
-        self.assertIn("LEFT JOIN roster_assignment_audit_detail", mysql.AUDIT_SQL)
+        self.assertEqual(params, ("ASSIGN_ROSTER", 2))
+        self.assertNotIn("roster_assignment_audit_detail", mysql.AUDIT_SQL)
+        self.assertIn("audit.outcome = 'ACCEPTED'", mysql.AUDIT_SQL)
+        self.assertIn("audit.roster_id IS NOT NULL", mysql.AUDIT_SQL)
+        self.assertIn("LEFT JOIN roster_assignment", mysql.AUDIT_SQL)
 
     def test_inconsistent_persisted_detail_is_an_explicit_data_error(self):
         row = audit_row(1, datetime(2026, 9, 20, 8), outcome="ACCEPTED")
-        row["detail_outcome"] = "REJECTED"
+        row["outcome"] = "REJECTED"
         with self.assertRaises(RosterDataError) as caught:
             self.run_audit((row,))
         self.assertEqual(caught.exception.error_code, "ROSTER_DATA_INVALID")
+
+    def test_missing_join_or_inconsistent_request_facts_are_data_errors(self):
+        changes = (
+            {"request_key": None}, {"attempted_route_id": None}, {"linked_roster_id": None},
+            {"attempted_end_time": datetime(2026, 9, 22, 9)},
+            {"attempted_end_time": datetime(2026, 9, 22, 8)},
+            {"entity_name": "delivery_route"}, {"entity_id": 99},
+            {"assignment_dispatcher_id": 999}, {"occurred_at": None},
+        )
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(RosterDataError) as caught:
+                self.run_audit((audit_row(1, datetime(2026, 9, 20, 8)) | change,))
+            self.assertEqual(caught.exception.error_code, "ROSTER_DATA_INVALID")
 
     def test_database_failure_maps_explicitly_and_closes_connection(self):
         cursor = AuditCursor(fail=True)

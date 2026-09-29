@@ -1,4 +1,4 @@
-"""Focused, storage-free checks for the provisional demo-v1 roster policy."""
+"""Focused, storage-free checks for the provisional kandypack-roster policy."""
 
 import unittest
 from datetime import datetime, timedelta
@@ -70,7 +70,7 @@ class DemoV1RosterPolicyTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, code)
 
     def test_policy_is_explicitly_provisional_demo_v1(self):
-        self.assertEqual(self.policy.policy_id, "demo-v1")
+        self.assertEqual(self.policy.policy_id, "kandypack-roster")
         self.assertEqual(self.policy.validate(roster(), proposal()).duration_seconds, 3600)
 
     def test_resources_must_exist(self):

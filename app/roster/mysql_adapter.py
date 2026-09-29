@@ -1,7 +1,7 @@
 """Explicit MySQL roster reads and one atomic assignment operation.
 
 Uses the existing connection manager without altering authentication sessions.
-No seed, write, stored-procedure call, or development fallback exists here.
+No seed, legacy stored-procedure call, or development fallback exists here.
 Asia/Colombo requires system IANA timezone data (or tzdata on Windows).
 """
 
@@ -19,6 +19,7 @@ from app.roster.policy import (
 )
 from app.roster.repository import (
     AssignmentOperationResult, RosterBusinessRejection, RosterDataError, RosterWindowError,
+    RosterIdempotencyConflict,
 )
 from app.roster.schemas import (
     Assignment, AssignmentsResponse, AuditAttempt, AuditResponse, CandidatesResponse,
@@ -65,36 +66,33 @@ HOURS_SQL = """
 """
 AUDIT_SQL = """
     SELECT audit.audit_id, audit.user_id AS actor_id, actor.name AS actor_name,
-           audit.outcome AS base_outcome, audit.occurred_at,
-           detail.audit_id AS detail_audit_id, detail.request_key,
-           detail.roster_id AS assignment_id,
-           detail.route_id AS attempted_route_id,
-           detail.truck_id AS attempted_truck_id,
-           detail.driver_id AS attempted_driver_id,
-           detail.assistant_id AS attempted_assistant_id,
-           detail.start_time AS attempted_start_time,
-           detail.end_time AS attempted_end_time,
-           detail.duration_seconds AS attempted_duration_seconds,
-           detail.policy_id, detail.outcome AS detail_outcome,
-           detail.reason_code
+           audit.outcome, audit.occurred_at, ra.request_key,
+           audit.entity_name, audit.entity_id, audit.roster_id AS assignment_id,
+           ra.roster_id AS linked_roster_id, ra.dispatcher_id AS assignment_dispatcher_id,
+           ra.route_id AS attempted_route_id, ra.truck_id AS attempted_truck_id,
+           ra.driver_id AS attempted_driver_id, ra.assistant_id AS attempted_assistant_id,
+           ra.start_time AS attempted_start_time, ra.end_time AS attempted_end_time
     FROM audit_log AS audit
-    LEFT JOIN roster_assignment_audit_detail AS detail
-        ON detail.audit_id = audit.audit_id
+    LEFT JOIN roster_assignment AS ra ON ra.roster_id = audit.roster_id
     LEFT JOIN `user` AS actor ON actor.user_id = audit.user_id
-    WHERE audit.entity_name = %s OR detail.audit_id IS NOT NULL
+    WHERE audit.action = %s AND audit.outcome = 'ACCEPTED'
+      AND audit.roster_id IS NOT NULL
     ORDER BY audit.occurred_at DESC, audit.audit_id DESC
     LIMIT %s
 """
 
 DUPLICATE_REQUEST_SQL = """
-    SELECT detail.outcome AS audit_outcome, detail.reason_code,
+    SELECT audit.audit_id, audit.action AS audit_action, audit.outcome AS audit_outcome,
+           audit.entity_name, audit.entity_id,
+           audit.user_id AS actor_id, audit.roster_id AS audit_roster_id,
            ra.roster_id, ra.route_id, ra.truck_id, ra.driver_id, ra.assistant_id,
            ra.dispatcher_id, ra.start_time, ra.end_time, ra.status, ra.created_at
-    FROM roster_assignment_audit_detail AS detail
-    LEFT JOIN roster_assignment AS ra ON ra.roster_id = detail.roster_id
-    WHERE detail.request_key = %s
-    FOR UPDATE
+    FROM roster_assignment AS ra
+    LEFT JOIN audit_log AS audit ON audit.roster_id = ra.roster_id
+    WHERE ra.request_key = %s
 """
+# Assignment request facts are immutable. READ COMMITTED lookups need not lock a
+# replayed assignment before another request's policy/resource locks.
 LOCK_ROUTE_SQL = """
     SELECT route_id, station_id, route_name,
            TIME_TO_SEC(max_delivery_time) AS max_duration_seconds
@@ -130,8 +128,8 @@ LOCK_HISTORY_SQL = """
 INSERT_ASSIGNMENT_SQL = """
     INSERT INTO roster_assignment
         (route_id, truck_id, driver_id, assistant_id, dispatcher_id,
-         start_time, end_time, status)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+         start_time, end_time, status, request_key)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 UPDATE_WORK_HOURS_SQL = """
     UPDATE delivery_staff
@@ -139,15 +137,9 @@ UPDATE_WORK_HOURS_SQL = """
     WHERE delivery_staff_id IN (%s, %s)
 """
 INSERT_AUDIT_SQL = """
-    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
-    VALUES (%s, %s, %s, %s, %s)
-"""
-INSERT_AUDIT_DETAIL_SQL = """
-    INSERT INTO roster_assignment_audit_detail
-        (audit_id, request_key, roster_id, route_id, truck_id, driver_id,
-         assistant_id, start_time, end_time, duration_seconds, policy_id,
-         outcome, reason_code)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    INSERT INTO audit_log
+        (user_id, action, entity_id, outcome, entity_name, roster_id)
+    VALUES (%s, %s, %s, %s, %s, %s)
 """
 SELECT_ASSIGNMENT_SQL = """
     SELECT roster_id, route_id, truck_id, driver_id, assistant_id, dispatcher_id,
@@ -156,6 +148,19 @@ SELECT_ASSIGNMENT_SQL = """
 """
 # Invalid intervals cannot be reliably assigned to a window. Include them so
 # corrupt history raises an explicit error instead of disappearing in filtering.
+
+
+class _RequestKeyRace(Exception):
+    """Only the request-key unique constraint can trigger replay recovery."""
+
+
+def _insert_assignment(cursor, parameters) -> None:
+    try:
+        cursor.execute(INSERT_ASSIGNMENT_SQL, parameters)
+    except pymysql.IntegrityError as exc:
+        if exc.args and exc.args[0] == 1062 and "uq_roster_assignment_request_key" in str(exc):
+            raise _RequestKeyRace() from exc
+        raise
 
 
 def _invalid() -> RosterDataError:
@@ -185,10 +190,6 @@ def _nonnegative_integer(value) -> int:
     if not 0 <= result <= 9007199254740991:
         raise _invalid()
     return result
-
-
-def _optional_positive_integer(value) -> int | None:
-    return None if value is None else _positive_integer(value)
 
 
 def _text(value) -> str:
@@ -222,10 +223,6 @@ def _stored_datetime(value, zone: ZoneInfo) -> datetime:
             or aware.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) != value):
         raise _invalid()
     return aware
-
-
-def _optional_stored_datetime(value, zone: ZoneInfo) -> datetime | None:
-    return None if value is None else _stored_datetime(value, zone)
 
 
 def _database_error(exc: pymysql.MySQLError) -> RosterDataError:
@@ -263,45 +260,20 @@ def _assignment(row: dict, zone: ZoneInfo) -> Assignment:
 
 
 def _audit_attempt(row: dict, zone: ZoneInfo) -> AuditAttempt:
-    legacy = row["detail_audit_id"] is None
-    base_outcome = _text(row["base_outcome"])
-
-    if legacy:
-        return AuditAttempt(
-            audit_id=_positive_integer(row["audit_id"]),
-            actor_id=_positive_integer(row["actor_id"]),
-            actor_name=_optional_text(row["actor_name"]),
-            attempted_route_id=None,
-            attempted_truck_id=None,
-            attempted_driver_id=None,
-            attempted_assistant_id=None,
-            attempted_start_time=None,
-            attempted_end_time=None,
-            attempted_duration_seconds=None,
-            outcome=base_outcome,
-            reason_code=None,
-            policy_id=None,
-            request_key=None,
-            assignment_id=None,
-            occurred_at=_optional_stored_datetime(row["occurred_at"], zone),
-            legacy=True,
-        )
-
-    detail_outcome = row["detail_outcome"]
-    if detail_outcome not in {"ACCEPTED", "REJECTED"} or detail_outcome != base_outcome:
-        raise _invalid()
-    assignment_id = _optional_positive_integer(row["assignment_id"])
-    reason_code = _optional_text(row["reason_code"])
-    if ((detail_outcome == "ACCEPTED" and (assignment_id is None or reason_code is not None))
-            or (detail_outcome == "REJECTED" and (assignment_id is not None or reason_code is None))):
+    assignment_id = _positive_integer(row["assignment_id"])
+    actor_id = _positive_integer(row["actor_id"])
+    if (row["outcome"] != "ACCEPTED"
+            or row["entity_name"] != "roster_assignment"
+            or row["entity_id"] != assignment_id
+            or row["linked_roster_id"] != assignment_id
+            or row["assignment_dispatcher_id"] != actor_id):
         raise _invalid()
     attempted_start = _stored_datetime(row["attempted_start_time"], zone)
     attempted_end = _stored_datetime(row["attempted_end_time"], zone)
-    if attempted_end.astimezone(timezone.utc) <= attempted_start.astimezone(timezone.utc):
-        raise _invalid()
+    elapsed = int((attempted_end.astimezone(timezone.utc) - attempted_start.astimezone(timezone.utc)).total_seconds())
     return AuditAttempt(
         audit_id=_positive_integer(row["audit_id"]),
-        actor_id=_positive_integer(row["actor_id"]),
+        actor_id=actor_id,
         actor_name=_optional_text(row["actor_name"]),
         attempted_route_id=_positive_integer(row["attempted_route_id"]),
         attempted_truck_id=_positive_integer(row["attempted_truck_id"]),
@@ -309,13 +281,13 @@ def _audit_attempt(row: dict, zone: ZoneInfo) -> AuditAttempt:
         attempted_assistant_id=_positive_integer(row["attempted_assistant_id"]),
         attempted_start_time=attempted_start,
         attempted_end_time=attempted_end,
-        attempted_duration_seconds=_nonnegative_integer(row["attempted_duration_seconds"]),
-        outcome=detail_outcome,
-        reason_code=reason_code,
-        policy_id=_text(row["policy_id"]),
+        attempted_duration_seconds=_positive_integer(elapsed),
+        outcome="ACCEPTED",
+        reason_code=None,
+        policy_id=None,
         request_key=_text(row["request_key"]),
         assignment_id=assignment_id,
-        occurred_at=_optional_stored_datetime(row["occurred_at"], zone),
+        occurred_at=_stored_datetime(row["occurred_at"], zone),
         legacy=False,
     )
 
@@ -430,7 +402,7 @@ class MySQLRosterAdapter:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise RosterWindowError("Audit limit must be an integer from 1 through 100.")
         with _snapshot() as cursor:
-            cursor.execute(AUDIT_SQL, ("roster_assignment", limit))
+            cursor.execute(AUDIT_SQL, ("ASSIGN_ROSTER", limit))
             attempts = tuple(_audit_attempt(row, zone) for row in cursor.fetchall())
             return AuditResponse(attempts=attempts, meta=MySQLWriteMeta())
 
@@ -458,7 +430,7 @@ class MySQLRosterAdapter:
                     cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                     connection.begin()
                     try:
-                        duplicate = self._duplicate_result(cursor, request_key, zone)
+                        duplicate = self._duplicate_result(cursor, request_key, zone, proposal, actor_id, local_start, local_end)
                         if duplicate is not None:
                             connection.rollback()
                             return duplicate
@@ -467,14 +439,14 @@ class MySQLRosterAdapter:
                         # The first lookup handles ordinary retries. Recheck after
                         # resource locks to observe a concurrent request that held
                         # the same resource locks when this transaction began.
-                        duplicate = self._duplicate_result(cursor, request_key, zone)
+                        duplicate = self._duplicate_result(cursor, request_key, zone, proposal, actor_id, local_start, local_end)
                         if duplicate is not None:
                             connection.rollback()
                             return duplicate
                         validation = DemoV1RosterPolicy().validate(roster, proposal)
-                        cursor.execute(INSERT_ASSIGNMENT_SQL, (
+                        _insert_assignment(cursor, (
                             proposal.route_id, proposal.truck_id, proposal.driver_id, proposal.assistant_id,
-                            actor_id, local_start, local_end, "SCHEDULED",
+                            actor_id, local_start, local_end, "SCHEDULED", request_key,
                         ))
                         roster_id = _positive_integer(cursor.lastrowid)
 
@@ -489,12 +461,7 @@ class MySQLRosterAdapter:
 
                         cursor.execute(INSERT_AUDIT_SQL, (
                             actor_id, "ASSIGN_ROSTER", roster_id, "ACCEPTED", "roster_assignment",
-                        ))
-                        audit_id = _positive_integer(cursor.lastrowid)
-                        cursor.execute(INSERT_AUDIT_DETAIL_SQL, (
-                            audit_id, request_key, roster_id, proposal.route_id, proposal.truck_id,
-                            proposal.driver_id, proposal.assistant_id, local_start, local_end,
-                            validation.duration_seconds, DemoV1RosterPolicy.policy_id, "ACCEPTED", None,
+                            roster_id,
                         ))
                         cursor.execute(SELECT_ASSIGNMENT_SQL, (roster_id,))
                         stored = cursor.fetchone()
@@ -505,14 +472,17 @@ class MySQLRosterAdapter:
                         return result
                     except RosterPolicyViolation as rejection:
                         connection.rollback()
-                        self._persist_rejection(
-                            connection, cursor, proposal, actor_id, request_key, local_start, local_end, rejection,
+                        return self._replay_after_rejection(
+                            connection, cursor, proposal, actor_id, request_key, local_start, local_end, rejection, zone,
                         )
-                        raise RosterBusinessRejection(rejection.code, rejection.message) from rejection
+                    except _RequestKeyRace:
+                        return self._recover_duplicate(
+                            connection, cursor, request_key, zone, proposal, actor_id, local_start, local_end,
+                        )
                     except Exception:
                         connection.rollback()
                         raise
-        except RosterBusinessRejection:
+        except (RosterBusinessRejection, RosterIdempotencyConflict):
             raise
         except RosterDataError:
             raise
@@ -522,18 +492,48 @@ class MySQLRosterAdapter:
             raise _invalid() from exc
 
     @staticmethod
-    def _duplicate_result(cursor, request_key: str, zone: ZoneInfo) -> AssignmentOperationResult | None:
+    def _duplicate_result(
+        cursor, request_key: str, zone: ZoneInfo, proposal: AssignmentProposal,
+        actor_id: int, local_start: datetime, local_end: datetime,
+    ) -> AssignmentOperationResult | None:
         cursor.execute(DUPLICATE_REQUEST_SQL, (request_key,))
         row = cursor.fetchone()
         if row is None:
             return None
-        if row["audit_outcome"] == "REJECTED":
-            raise RosterBusinessRejection(
-                row["reason_code"] or "ROSTER_REJECTED", "This assignment request was previously rejected.",
-            )
-        if row["audit_outcome"] != "ACCEPTED" or row["roster_id"] is None:
+        stored_request = tuple(row[key] for key in (
+            "dispatcher_id", "route_id", "truck_id", "driver_id",
+            "assistant_id", "start_time", "end_time",
+        ))
+        if stored_request != (
+            actor_id, proposal.route_id, proposal.truck_id, proposal.driver_id,
+            proposal.assistant_id, local_start, local_end,
+        ):
+            raise RosterIdempotencyConflict()
+        if (row["audit_id"] is None or row["audit_action"] != "ASSIGN_ROSTER"
+                or row["audit_outcome"] != "ACCEPTED"
+                or row["entity_name"] != "roster_assignment"
+                or row["entity_id"] != row["roster_id"]
+                or row["audit_roster_id"] != row["roster_id"]
+                or row["actor_id"] != row["dispatcher_id"]):
             raise _invalid()
         return AssignmentOperationResult(_assignment(row, zone), replayed=True)
+
+    def _recover_duplicate(
+        self, connection, cursor, request_key, zone, proposal, actor_id, local_start, local_end,
+    ) -> AssignmentOperationResult:
+        # Roll back ALL losing business work before observing the committed winner.
+        # Never retry policy/writes or infer success from error 1062 alone.
+        connection.rollback()
+        connection.begin()
+        try:
+            result = self._duplicate_result(
+                cursor, request_key, zone, proposal, actor_id, local_start, local_end,
+            )
+            if result is None:
+                raise RosterDataError("ROSTER_ASSIGNMENT_FAILED", "Committed request could not be reloaded.")
+            return result
+        finally:
+            connection.rollback()
 
     @staticmethod
     def _lock_policy_roster(cursor, proposal: AssignmentProposal, actor_id: int, zone: ZoneInfo) -> PolicyRoster:
@@ -573,35 +573,19 @@ class MySQLRosterAdapter:
         history = tuple(_assignment(row, zone) for row in cursor.fetchall())
         return PolicyRoster(routes=routes, trucks=trucks, staff=staff, assignments=history)
 
-    @staticmethod
-    def _persist_rejection(
-        connection, cursor, proposal: AssignmentProposal, actor_id: int, request_key: str,
-        local_start: datetime, local_end: datetime, rejection: RosterPolicyViolation,
-    ) -> None:
-        """Use a fresh transaction so rolling back business work cannot erase the audit."""
+    def _replay_after_rejection(
+        self, connection, cursor, proposal: AssignmentProposal, actor_id: int, request_key: str,
+        local_start: datetime, local_end: datetime, rejection: RosterPolicyViolation, zone: ZoneInfo,
+    ) -> AssignmentOperationResult:
+        """Observe a committed acceptance after rollback; never persist a rejection."""
+        connection.begin()
         try:
-            connection.begin()
-            duration_seconds = max(
-                0,
-                int((proposal.end_time.astimezone(timezone.utc) - proposal.start_time.astimezone(timezone.utc)).total_seconds()),
+            duplicate = self._duplicate_result(
+                cursor, request_key, zone, proposal, actor_id, local_start, local_end,
             )
-            cursor.execute(INSERT_AUDIT_SQL, (
-                actor_id, "ASSIGN_ROSTER", proposal.route_id, "REJECTED", "roster_assignment",
-            ))
-            audit_id = _positive_integer(cursor.lastrowid)
-            cursor.execute(INSERT_AUDIT_DETAIL_SQL, (
-                audit_id, request_key, None, proposal.route_id, proposal.truck_id,
-                proposal.driver_id, proposal.assistant_id, local_start, local_end,
-                duration_seconds, DemoV1RosterPolicy.policy_id, "REJECTED", rejection.code,
-            ))
-            connection.commit()
-        except Exception as exc:
+            if duplicate is not None:
+                return duplicate
+        finally:
             connection.rollback()
-            if isinstance(exc, pymysql.MySQLError):
-                mapped = _write_database_error(exc)
-                raise RosterDataError(
-                    "ROSTER_AUDIT_PERSISTENCE_FAILED", "Rejected roster decision could not be audited.",
-                ) from mapped
-            raise RosterDataError(
-                "ROSTER_AUDIT_PERSISTENCE_FAILED", "Rejected roster decision could not be audited.",
-            ) from exc
+        # A rejected key is unreserved. A future attempt is validated afresh.
+        raise RosterBusinessRejection(rejection.code, rejection.message) from rejection

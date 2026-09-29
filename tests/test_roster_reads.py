@@ -77,7 +77,7 @@ class RosterReadsTests(unittest.TestCase):
             self.assert_no_store(response)
             payload = response.json()
             self.assertEqual(payload["meta"], {
-                "data_source": "dev-memory", "policy_id": "demo-v1", "policy_confirmed": False,
+                "data_source": "dev-memory", "policy_id": "kandypack-roster", "policy_confirmed": False,
                 "timezone": "Asia/Colombo", "volatile": True, "fixture_week_start": "2026-09-14",
             })
             self.assertEqual(payload["routes"][0]["station_id"], "CMB")

@@ -20,7 +20,7 @@ from app.roster.mysql_adapter import MySQLRosterAdapter
 from app.roster.policy import AssignmentProposal
 from app.roster.repository import (
     RosterBusinessRejection, RosterDataError, RosterReportingRepository, RosterRepository,
-    RosterWindowError,
+    RosterWindowError, RosterIdempotencyConflict,
 )
 from app.roster.schemas import (
     AssignmentCreatedResponse, AssignmentRequest, AssignmentsResponse, AuditResponse,
@@ -200,6 +200,11 @@ def assign_roster(
             message="Roster assignment already exists." if result.replayed else "Roster assignment created.",
             assignment=result.assignment,
         )
+    except RosterIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": exc.error_code, "message": exc.message},
+        ) from exc
     except RosterBusinessRejection as exc:
         missing = {"ROUTE_NOT_FOUND", "TRUCK_NOT_FOUND", "DRIVER_NOT_FOUND", "ASSISTANT_NOT_FOUND"}
         invalid = {

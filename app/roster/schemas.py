@@ -31,7 +31,7 @@ class FrozenModel(BaseModel):
 
 class RosterMeta(FrozenModel):
     data_source: Literal["dev-memory"] = "dev-memory"
-    policy_id: Literal["demo-v1"] = "demo-v1"
+    policy_id: Literal["kandypack-roster"] = "kandypack-roster"
     policy_confirmed: Literal[False] = False
     timezone: Literal["Asia/Colombo"] = "Asia/Colombo"
     volatile: Literal[True] = True
@@ -49,7 +49,7 @@ class MySQLMeta(FrozenModel):
 
 class MySQLWriteMeta(FrozenModel):
     data_source: Literal["mysql"] = "mysql"
-    policy_id: Literal["demo-v1"] = "demo-v1"
+    policy_id: Literal["kandypack-roster"] = "kandypack-roster"
     policy_confirmed: Literal[False] = False
     timezone: Literal["Asia/Colombo"] = "Asia/Colombo"
     volatile: Literal[False] = False
@@ -158,23 +158,25 @@ class HoursResponse(FrozenModel):
 
 
 class AuditAttempt(FrozenModel):
+    """One accepted assignment; historical policy/rejection fields are unavailable."""
+
     audit_id: PositiveInt
     actor_id: PositiveInt
     actor_name: str | None
-    attempted_route_id: PositiveInt | None
-    attempted_truck_id: PositiveInt | None
-    attempted_driver_id: PositiveInt | None
-    attempted_assistant_id: PositiveInt | None
-    attempted_start_time: AwareDatetime | None
-    attempted_end_time: AwareDatetime | None
-    attempted_duration_seconds: int | None = Field(default=None, ge=0)
-    outcome: str = Field(min_length=1)
-    reason_code: str | None
-    policy_id: str | None
-    request_key: str | None
-    assignment_id: PositiveInt | None
-    occurred_at: AwareDatetime | None
-    legacy: bool
+    attempted_route_id: PositiveInt
+    attempted_truck_id: PositiveInt
+    attempted_driver_id: PositiveInt
+    attempted_assistant_id: PositiveInt
+    attempted_start_time: AwareDatetime
+    attempted_end_time: AwareDatetime
+    attempted_duration_seconds: PositiveInt
+    outcome: Literal["ACCEPTED"]
+    reason_code: None = None
+    policy_id: None = None
+    request_key: str = Field(min_length=1, max_length=128)
+    assignment_id: PositiveInt
+    occurred_at: AwareDatetime
+    legacy: Literal[False] = False
 
 
 class AuditResponse(FrozenModel):

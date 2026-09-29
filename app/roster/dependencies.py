@@ -83,7 +83,6 @@ def get_roster_repository() -> RosterRepository:
 
 
 def get_roster_assignment_repository() -> MySQLRosterAdapter:
-    """Writes are durable-only; development fixtures never accept assignments."""
     if os.environ.get("ROSTER_DATA_MODE") == "mysql":
         return MySQLRosterAdapter()
     raise HTTPException(
@@ -96,7 +95,7 @@ def get_roster_assignment_repository() -> MySQLRosterAdapter:
 
 
 def get_roster_reporting_repository() -> RosterReportingRepository:
-    """Session 3A reports are database-backed and never synthesize durable history."""
+    """Return the database-backed repository for roster reports."""
     if os.environ.get("ROSTER_DATA_MODE") == "mysql":
         return MySQLRosterAdapter()
     if (os.environ.get("APP_ENV") == "development"

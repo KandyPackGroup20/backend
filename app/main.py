@@ -30,5 +30,31 @@ def root():
     return {
         "message": "Welcome to Kandypack Supply Chain Logistics API Gateway",
         "docs_url": "/docs",
+        "health_url": "/health",
         "version": settings.VERSION
     }
+
+@app.get("/health")
+def health_check():
+    db_status = "disconnected"
+    db_error = None
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 AS alive;")
+                res = cursor.fetchone()
+                if res and res.get("alive") == 1:
+                    db_status = "connected"
+    except Exception as e:
+        db_error = str(e)
+        
+    return {
+        "status": "healthy" if db_status == "connected" else "degraded",
+        "database": db_status,
+        "database_host": settings.MYSQL_HOST,
+        "database_name": settings.MYSQL_DATABASE,
+        "error": db_error,
+        "version": settings.VERSION
+    }
+

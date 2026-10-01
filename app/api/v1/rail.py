@@ -1,8 +1,9 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from app.core.database import get_db
 from app.core.security import require_roles
+from app.core.cache import get_cache, set_cache, invalidate_cache
 
 router = APIRouter(prefix="/rail", tags=["Rail Allocation & Schedules"])
 
@@ -52,6 +53,7 @@ def allocate_rail_capacity(
                 )
 
             conn.commit()
+            invalidate_cache("cache:rail:")
 
             # Allocation breakdown for presentation
             cursor.execute('''
@@ -120,8 +122,13 @@ def get_trip_capacity(
             return {"trips": trips}
 
 @router.get("/schedules")
-def get_train_schedules():
-    # Lists scheduled train trips with dynamically calculated remaining capacity
+def get_train_schedules(response: Response):
+    cache_key = "cache:rail:schedules"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute('''
@@ -145,4 +152,8 @@ def get_train_schedules():
                     trip['departure_datetime'] = trip['departure_datetime'].strftime("%Y-%m-%d %H:%M:%S")
                 if trip.get('arrival_datetime'):
                     trip['arrival_datetime'] = trip['arrival_datetime'].strftime("%Y-%m-%d %H:%M:%S")
-            return {"trips": trips}
+            
+            result = {"trips": trips}
+            set_cache(cache_key, result, ttl_seconds=60)
+            response.headers["X-Cache"] = "MISS"
+            return result

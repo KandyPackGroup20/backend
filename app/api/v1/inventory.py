@@ -1,0 +1,179 @@
+from datetime import datetime
+from typing import Optional
+
+import pymysql
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from app.core.database import get_db
+from app.core.security import get_current_user, require_roles
+
+router = APIRouter(prefix="/inventory", tags=["Station Inventory & Warehouse (Feature 4.4)"])
+
+
+# ---------- Request bodies ----------
+
+class ReceiveManifestRequest(BaseModel):
+    station_id: int
+    trip_id: int
+
+
+class StockAdjustmentRequest(BaseModel):
+    inventory_id: int
+    quantity_delta: int = Field(..., description="Positive to add stock, negative for damage/loss")
+    reason: str
+
+
+# ---------- Helpers ----------
+
+def _serialize_datetimes(row: dict, fields: list[str]) -> dict:
+    """Converts any datetime columns in a row to plain strings so FastAPI can return them as JSON."""
+    for f in fields:
+        if row.get(f) and isinstance(row[f], datetime):
+            row[f] = row[f].strftime("%Y-%m-%d %H:%M:%S")
+    return row
+
+
+# ---------- Endpoints ----------
+
+@router.get("/")
+def get_station_inventory(
+    station_id: Optional[int] = Query(None, description="Filter to one station; omit for all stations"),
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN", "LOGISTICS_MGR"]))
+):
+    """Feature 4.4: live stock levels per station/product (v_station_inventory)."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            if station_id is not None:
+                cursor.execute(
+                    "SELECT * FROM v_station_inventory WHERE station_id = %s ORDER BY product_id",
+                    (station_id,)
+                )
+            else:
+                cursor.execute("SELECT * FROM v_station_inventory ORDER BY station_id, product_id")
+            rows = cursor.fetchall()
+            for r in rows:
+                _serialize_datetimes(r, ["last_updated"])
+            return {"inventory": rows}
+
+
+@router.get("/manifests")
+def get_incoming_manifests(
+    station_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None, description="PENDING or RECEIVED"),
+    current_user: dict = Depends(require_roles(["STORE_MGR", "SUPERADMIN"]))
+):
+    """Feature 4.4: train arrivals waiting to be (or already) processed at a station."""
+    query = "SELECT * FROM v_incoming_train_manifests WHERE 1=1"
+    params = []
+    if station_id is not None:
+        query += " AND station_id = %s"
+        params.append(station_id)
+    if status is not None:
+        query += " AND manifest_status = %s"
+        params.append(status)
+    query += " ORDER BY departure_datetime"
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
+            for r in rows:
+                _serialize_datetimes(r, ["departure_datetime", "arrival_datetime", "received_at"])
+            return {"manifests": rows}
+
+
+@router.post("/manifests/receive")
+def receive_manifest(
+    payload: ReceiveManifestRequest,
+    current_user: dict = Depends(require_roles(["STORE_MGR", "SUPERADMIN"]))
+):
+    """Feature 4.4: Store Manager confirms a train has arrived, calling sp_receive_manifest.
+    Locks the manifest row, adds stock, and advances the related order(s)."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "CALL sp_receive_manifest(%s, %s, %s, @result_code);",
+                (payload.station_id, payload.trip_id, current_user["user_id"])
+            )
+            cursor.execute("SELECT @result_code AS result_code;")
+            res = cursor.fetchone()
+            result_code = res["result_code"] if res else "UNKNOWN"
+
+            if result_code == "MANIFEST_NOT_FOUND":
+                conn.rollback()
+                raise HTTPException(status_code=404, detail="No such manifest for that station/trip.")
+            if result_code == "MANIFEST_ALREADY_RECEIVED":
+                conn.rollback()
+                raise HTTPException(status_code=409, detail="This manifest has already been received.")
+            if result_code != "SUCCESS":
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=f"Receiving failed: {result_code}")
+
+            conn.commit()
+            return {
+                "station_id": payload.station_id,
+                "trip_id": payload.trip_id,
+                "result": result_code
+            }
+
+
+@router.post("/adjustments")
+def create_stock_adjustment(
+    payload: StockAdjustmentRequest,
+    current_user: dict = Depends(require_roles(["WAREHOUSE_STAFF", "STORE_MGR", "SUPERADMIN"]))
+):
+    """Feature 4.4: log damaged/missing stock (or a recount correction).
+    The trg_apply_stock_adjustment trigger updates the live stock automatically."""
+    if payload.quantity_delta == 0:
+        raise HTTPException(status_code=400, detail="quantity_delta cannot be zero.")
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            try:
+                cursor.execute(
+                    """INSERT INTO stock_adjustment (inventory_id, quantity_delta, reason, adjusted_by)
+                       VALUES (%s, %s, %s, %s)""",
+                    (payload.inventory_id, payload.quantity_delta, payload.reason, current_user["user_id"])
+                )
+                conn.commit()
+            except pymysql.err.MySQLError as e:
+                conn.rollback()
+                error_code = e.args[0]
+                if error_code == 3819:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="That adjustment would take stock below zero."
+                    )
+                raise HTTPException(status_code=500, detail=f"Could not save adjustment: {e}")
+
+            cursor.execute(
+                "SELECT stored_quantity FROM inventory WHERE inventory_id = %s",
+                (payload.inventory_id,)
+            )
+            row = cursor.fetchone()
+            return {
+                "inventory_id": payload.inventory_id,
+                "quantity_delta": payload.quantity_delta,
+                "new_stored_quantity": row["stored_quantity"] if row else None
+            }
+
+
+@router.get("/adjustments/{inventory_id}")
+def get_adjustment_history(
+    inventory_id: int,
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN"]))
+):
+    """Feature 4.4: history of damage/recount adjustments for one stock row, newest first."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT * FROM stock_adjustment
+                   WHERE inventory_id = %s
+                   ORDER BY adjusted_at DESC""",
+                (inventory_id,)
+            )
+            rows = cursor.fetchall()
+            for r in rows:
+                _serialize_datetimes(r, ["adjusted_at"])
+            return {"adjustments": rows}

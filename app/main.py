@@ -49,11 +49,15 @@ def health_check():
     except Exception as e:
         db_error = str(e)
         
+    from app.core.cache import get_cache_status
+    cache_status = get_cache_status()
+        
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
         "database": db_status,
         "database_host": settings.MYSQL_HOST,
         "database_name": settings.MYSQL_DATABASE,
+        "cache": cache_status,
         "error": db_error,
         "version": settings.VERSION
     }

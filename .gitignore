@@ -1,9 +1,62 @@
-.env
-.env.*
-!.env.example
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
 .venv/
 venv/
 env/
-__pycache__/
-*.py[cod]
+ENV/
+
+# Test and coverage output
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.testmondata
+
+# Type checking, linting, and test-tool caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+
+# Local environment files (keep example templates trackable)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs and runtime output
+*.log
+logs/
+
+# Generated local development databases only
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated local uploads and temporary files
+uploads/
+tmp/
+temp/
+
+# OS and editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.temp
+*.orig
+.idea/
+
+# Local working documents
+/docs/member3-plan.md
+/docs/roster-api-contract.md
+/docs/member3-progress.md
+/docs/audit-log-refactor-verification.md
+/docs/session-2-live-acceptance-report.md

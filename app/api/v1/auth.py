@@ -9,6 +9,11 @@ from app.core.security import (
     get_current_user,
     require_roles
 )
+from app.core.cache import (
+    check_rate_limit,
+    record_login_failure,
+    reset_login_failures
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication & Identity (Feature 4.1)"])
 
@@ -65,16 +70,24 @@ class UserProfileResponse(BaseModel):
     
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, response: Response):
+    # rate limit check
+    allowed, remaining = check_rate_limit(payload.email, max_attempts=5, window_seconds=60)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="TOO_MANY_FAILED_ATTEMPTS: Account temporarily locked due to excessive failed attempts. Please retry in 60 seconds."
+        )
+
     with get_db() as conn:
         with conn.cursor() as cursor:
-            # Policy 1: Enforce Staff Email Domain for Staff/Admin Portal
+            # check staff email domain
             if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
                 )
 
-            # Policy 2: Strictly Parameterized Query (prevents SQL Injection)
+            # fetch user
             cursor.execute(
                 """
                 SELECT user_id, email, password_hash, name, role, force_password_reset 
@@ -86,19 +99,24 @@ def login(payload: LoginRequest, response: Response):
             user = cursor.fetchone()
             
             if not user:
+                record_login_failure(payload.email, window_seconds=60)
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, 
                     detail="ACCOUNT_NOT_FOUND: User does not exist or account is inactive."
                 )
             
-            # Policy 3: Verify Password Hash
+            # verify password
             if not verify_password(payload.password, user['password_hash']) and payload.password != "password123":
+                fails = record_login_failure(payload.email, window_seconds=60)
+                rem = max(0, 5 - fails)
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, 
-                    detail="INVALID_CREDENTIALS: Incorrect email or password."
+                    detail=f"INVALID_CREDENTIALS: Incorrect email or password. ({rem} attempt(s) remaining)"
                 )
             
-            # Policy 4 (REQ-2): Customer Login Barrier Check
+            reset_login_failures(payload.email)
+
+            # restrict customer from admin portal
             if payload.portal_type == "admin" and user['role'] == "CUSTOMER":
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,

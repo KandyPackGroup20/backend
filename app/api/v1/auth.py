@@ -66,6 +66,12 @@ class UserProfileResponse(BaseModel):
     address_line: Optional[str] = None
     route_id: Optional[int] = None
 
+class ProfileUpdateRequest(BaseModel):
+    name: str = Field(min_length=2)
+    phone: Optional[str] = None
+    city: Optional[str] = None
+    address_line: Optional[str] = None
+
     
 # 1. Login Endpoint (Strictly Parameterized / SQLi Protected)
     
@@ -411,6 +417,91 @@ def get_current_user_profile(current_user: dict = Depends(get_current_user)):
             profile = cursor.fetchone()
             if not profile:
                 raise HTTPException(status_code=404, detail="User not found")
+
+            return {
+                "user_id": profile["user_id"],
+                "name": profile["name"],
+                "email": profile["email"],
+                "role": profile["role"],
+                "force_password_reset": bool(profile["force_password_reset"]),
+                "customer_id": profile.get("customer_id"),
+                "phone": profile.get("phone"),
+                "city": profile.get("city"),
+                "address_line": profile.get("address_line"),
+                "route_id": profile.get("route_id")
+            }
+
+@router.put("/me", response_model=UserProfileResponse)
+def update_current_user_profile(
+    payload: ProfileUpdateRequest,
+    response: Response,
+    current_user: dict = Depends(get_current_user)
+):
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            # Update user table name
+            cursor.execute(
+                "UPDATE user SET name = %s WHERE user_id = %s",
+                (payload.name, current_user["user_id"])
+            )
+
+            # Check if customer record exists
+            cursor.execute(
+                "SELECT customer_id FROM customer WHERE user_id = %s",
+                (current_user["user_id"],)
+            )
+            cust = cursor.fetchone()
+            if cust:
+                cursor.execute(
+                    """
+                    UPDATE customer 
+                    SET customer_name = %s,
+                        phone = COALESCE(%s, phone),
+                        address_line = COALESCE(%s, address_line),
+                        city = COALESCE(%s, city)
+                    WHERE user_id = %s
+                    """,
+                    (
+                        payload.name,
+                        payload.phone,
+                        payload.address_line,
+                        payload.city,
+                        current_user["user_id"]
+                    )
+                )
+            conn.commit()
+
+            cursor.execute(
+                """
+                SELECT u.user_id, u.name, u.email, u.role, u.force_password_reset,
+                       c.customer_id, c.phone, c.city, c.address_line, c.route_id
+                FROM user u
+                LEFT JOIN customer c ON u.user_id = c.user_id
+                WHERE u.user_id = %s AND u.is_active = 1
+                """,
+                (current_user["user_id"],)
+            )
+            profile = cursor.fetchone()
+            if not profile:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Refresh token with updated name
+            new_token = create_access_token(data={
+                "sub": str(current_user["user_id"]),
+                "email": current_user["email"],
+                "name": profile["name"],
+                "role": current_user["role"],
+                "force_password_reset": bool(profile["force_password_reset"])
+            })
+
+            response.set_cookie(
+                key="kandypack_session",
+                value=new_token,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                max_age=3600 * 24
+            )
 
             return {
                 "user_id": profile["user_id"],

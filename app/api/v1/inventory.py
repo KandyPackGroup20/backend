@@ -248,3 +248,72 @@ def get_adjustment_history(
             for r in rows:
                 _serialize_datetimes(r, ["adjusted_at"])
             return {"adjustments": rows}
+
+
+@router.get("/my-station")
+def get_my_station(
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN"]))
+):
+    """Feature 4.4: Returns the station store managed by or assigned to the current user."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT station_id, city, address, manager_id FROM station_store WHERE manager_id = %s",
+                (current_user["user_id"],)
+            )
+            station = cursor.fetchone()
+            if not station:
+                cursor.execute("SELECT station_id, city, address, manager_id FROM station_store WHERE station_id = 1")
+                station = cursor.fetchone()
+            return {"assigned_station": station}
+
+
+@router.get("/reports/summary")
+def get_inventory_summary_report(
+    station_id: Optional[int] = Query(None, description="Station ID for Report 6 summary; omit for all stations"),
+    current_user: dict = Depends(require_roles(["STORE_MGR", "LOGISTICS_MGR", "SUPERADMIN"]))
+):
+    """Feature 4.4 / Report 6: Station Inventory & Adjustment Summary Report."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            stock_query = """
+                SELECT 
+                    COUNT(DISTINCT inv.product_id) AS total_distinct_products,
+                    IFNULL(SUM(inv.stored_quantity), 0) AS total_stored_quantity,
+                    IFNULL(SUM(inv.stored_quantity * p.unit_price), 0.00) AS total_inventory_value
+                FROM inventory inv
+                JOIN product p ON inv.product_id = p.product_id
+            """
+            params = []
+            if station_id is not None:
+                stock_query += " WHERE inv.station_id = %s"
+                params.append(station_id)
+            cursor.execute(stock_query, tuple(params))
+            stock_summary = cursor.fetchone()
+
+            adj_query = "SELECT * FROM v_stock_adjustment_summary WHERE 1=1"
+            adj_params = []
+            if station_id is not None:
+                adj_query += " AND station_id = %s"
+                adj_params.append(station_id)
+            adj_query += " ORDER BY total_loss_value DESC"
+            cursor.execute(adj_query, tuple(adj_params))
+            adjustments = cursor.fetchall()
+
+            total_damaged_units = sum(int(a["total_units_damaged_or_lost"]) for a in adjustments)
+            total_loss_value = sum(float(a["total_loss_value"]) for a in adjustments)
+
+            for a in adjustments:
+                _serialize_datetimes(a, ["first_adjustment_at", "latest_adjustment_at"])
+
+            return {
+                "station_id": station_id,
+                "overview": {
+                    "total_distinct_products": stock_summary["total_distinct_products"] if stock_summary else 0,
+                    "total_stored_units": int(stock_summary["total_stored_quantity"]) if stock_summary else 0,
+                    "total_inventory_value_lkr": float(stock_summary["total_inventory_value"]) if stock_summary else 0.00,
+                    "total_damaged_or_lost_units": total_damaged_units,
+                    "total_loss_value_lkr": total_loss_value
+                },
+                "breakdown": adjustments
+            }

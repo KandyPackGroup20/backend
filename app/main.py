@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api.v1 import auth, rail, roster, reports, notifications
+from app.api.v1 import auth, rail, roster, reports, notifications, orders
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -20,6 +20,7 @@ app.add_middleware(
 
 # Include API v1 Routers
 app.include_router(auth.router, prefix=settings.API_V1_STR)
+app.include_router(orders.router, prefix=settings.API_V1_STR)
 app.include_router(rail.router, prefix=settings.API_V1_STR)
 app.include_router(roster.router, prefix=settings.API_V1_STR)
 app.include_router(reports.router, prefix=settings.API_V1_STR)

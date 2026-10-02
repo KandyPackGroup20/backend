@@ -278,11 +278,17 @@ def create_staff_user(
             pw_hash = get_password_hash(payload.password)
 
             try:
-                # Trigger trg_user_account_creation_policy enforces domain check and force_password_reset = 1
+                # Enforce domain check and explicitly set force_password_reset = 1 for staff accounts
+                if not payload.email.endswith("@kandypack.lk"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="SECURITY POLICY VIOLATION: Internal staff users must have an email ending with @kandypack.lk"
+                    )
+
                 cursor.execute(
                     """
-                    INSERT INTO user (name, role, email, password_hash)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
+                    VALUES (%s, %s, %s, %s, 1, 1)
                     """,
                     (payload.name, payload.role, payload.email, pw_hash)
                 )

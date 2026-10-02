@@ -445,30 +445,29 @@ def update_current_user_profile(
                 (payload.name, current_user["user_id"])
             )
 
-            # Check if customer record exists
+            # Upsert into customer table so all accounts (staff and customers) have persistent contact details
+            phone_val = payload.phone or "0770000000"
+            addr_val = payload.address_line or "Kandy Logistics Central Store"
+            city_val = payload.city or "Colombo"
+
             cursor.execute(
-                "SELECT customer_id FROM customer WHERE user_id = %s",
-                (current_user["user_id"],)
-            )
-            cust = cursor.fetchone()
-            if cust:
-                cursor.execute(
-                    """
-                    UPDATE customer 
-                    SET customer_name = %s,
-                        phone = COALESCE(%s, phone),
-                        address_line = COALESCE(%s, address_line),
-                        city = COALESCE(%s, city)
-                    WHERE user_id = %s
-                    """,
-                    (
-                        payload.name,
-                        payload.phone,
-                        payload.address_line,
-                        payload.city,
-                        current_user["user_id"]
-                    )
+                """
+                INSERT INTO customer (user_id, customer_name, route_id, phone, address_line, city, postal_code)
+                VALUES (%s, %s, 1, %s, %s, %s, '20000')
+                ON DUPLICATE KEY UPDATE 
+                    customer_name = VALUES(customer_name),
+                    phone = VALUES(phone),
+                    address_line = VALUES(address_line),
+                    city = VALUES(city)
+                """,
+                (
+                    current_user["user_id"],
+                    payload.name,
+                    phone_val,
+                    addr_val,
+                    city_val
                 )
+            )
             conn.commit()
 
             cursor.execute(

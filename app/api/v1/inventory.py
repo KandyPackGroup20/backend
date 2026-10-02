@@ -24,6 +24,10 @@ class StockAdjustmentRequest(BaseModel):
     reason: str
 
 
+class AssignBinRequest(BaseModel):
+    location_id: Optional[int] = Field(None, description="Storage location ID to assign, or None to unbind")
+
+
 # ---------- Helpers ----------
 
 def _serialize_datetimes(row: dict, fields: list[str]) -> dict:
@@ -81,6 +85,73 @@ def get_incoming_manifests(
             for r in rows:
                 _serialize_datetimes(r, ["departure_datetime", "arrival_datetime", "received_at"])
             return {"manifests": rows}
+
+
+@router.get("/manifests/{trip_id}/items")
+def get_manifest_cargo_items(
+    trip_id: int,
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN", "LOGISTICS_MGR"]))
+):
+    """Feature 4.4: Inspect allocated cargo items arriving on a train trip before receiving."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM v_trip_manifest_items WHERE trip_id = %s ORDER BY product_id",
+                (trip_id,)
+            )
+            items = cursor.fetchall()
+            return {"trip_id": trip_id, "items": items}
+
+
+@router.get("/bins")
+def get_station_bins(
+    station_id: int = Query(..., description="Station ID to fetch bins for"),
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN"]))
+):
+    """Feature 4.4 / FR-4.4.6: List bin storage locations available at a station store."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT location_id, station_id, location_code, location_type FROM storage_location WHERE station_id = %s ORDER BY location_code",
+                (station_id,)
+            )
+            rows = cursor.fetchall()
+            return {"bins": rows}
+
+
+@router.put("/{inventory_id}/bin")
+def assign_bin_location(
+    inventory_id: int,
+    payload: AssignBinRequest,
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN"]))
+):
+    """Feature 4.4 / FR-4.4.6: Assign or update bin storage location for an inventory item."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            if payload.location_id is not None:
+                cursor.execute(
+                    """SELECT sl.location_id 
+                       FROM storage_location sl
+                       JOIN inventory inv ON sl.station_id = inv.station_id
+                       WHERE inv.inventory_id = %s AND sl.location_id = %s""",
+                    (inventory_id, payload.location_id)
+                )
+                if not cursor.fetchone():
+                    raise HTTPException(status_code=400, detail="INVALID_BIN: Selected bin does not belong to this station store.")
+
+            cursor.execute(
+                "UPDATE inventory SET location_id = %s WHERE inventory_id = %s",
+                (payload.location_id, inventory_id)
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Inventory item not found.")
+            conn.commit()
+
+            cursor.execute("SELECT * FROM v_station_inventory WHERE inventory_id = %s", (inventory_id,))
+            updated = cursor.fetchone()
+            if updated:
+                _serialize_datetimes(updated, ["last_updated"])
+            return {"message": "Bin location updated successfully", "inventory": updated}
 
 
 @router.post("/manifests/receive")

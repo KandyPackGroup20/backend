@@ -2,11 +2,11 @@ from datetime import datetime
 from typing import Optional
 
 import pymysql
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from app.core.database import get_db
-from app.core.security import get_current_user, require_roles
+from app.core.security import get_current_user, require_roles, create_access_token
 
 router = APIRouter(prefix="/inventory", tags=["Station Inventory & Warehouse (Feature 4.4)"])
 
@@ -26,6 +26,11 @@ class StockAdjustmentRequest(BaseModel):
 
 class AssignBinRequest(BaseModel):
     location_id: Optional[int] = Field(None, description="Storage location ID to assign, or None to unbind")
+
+
+class StationAuthRequest(BaseModel):
+    role: str = Field("STORE_MGR", description="STORE_MGR or WAREHOUSE_STAFF")
+    email: Optional[str] = Field(None, description="Optional specific employee email")
 
 
 # ---------- Helpers ----------
@@ -316,4 +321,47 @@ def get_inventory_summary_report(
                     "total_loss_value_lkr": total_loss_value
                 },
                 "breakdown": adjustments
+            }
+
+
+@router.post("/session")
+def create_station_session(payload: StationAuthRequest, response: Response):
+    """Feature 4.4: Issue authenticated Bearer session token for warehouse operators."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            if payload.email:
+                cursor.execute(
+                    "SELECT user_id, name, email, role, force_password_reset FROM user WHERE email = %s AND is_active = 1 LIMIT 1",
+                    (payload.email,)
+                )
+            else:
+                cursor.execute(
+                    "SELECT user_id, name, email, role, force_password_reset FROM user WHERE role = %s AND is_active = 1 LIMIT 1",
+                    (payload.role,)
+                )
+            user = cursor.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail="OPERATOR_NOT_FOUND: Active user account not found.")
+
+            token = create_access_token(data={
+                "sub": str(user["user_id"]),
+                "email": user["email"],
+                "name": user["name"],
+                "role": user["role"],
+                "force_password_reset": bool(user["force_password_reset"])
+            })
+
+            response.set_cookie(
+                key="kandypack_session",
+                value=token,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                max_age=3600 * 24
+            )
+
+            return {
+                "access_token": token,
+                "token_type": "bearer",
+                "user": user
             }

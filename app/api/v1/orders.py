@@ -6,6 +6,7 @@ import re
 
 from app.core.database import get_db
 from app.core.security import get_token_from_request, decode_access_token
+from app.core.notifications import log_and_dispatch_email
 
 router = APIRouter(prefix="/orders", tags=["Customer Orders & Consignments"])
 
@@ -38,6 +39,21 @@ def normalize_status(raw: str) -> str:
         return "issue"
     return "pending"
 
+class ProductCatalogueItem(BaseModel):
+    product_id: int
+    product_name: str
+    category: str
+    unit_price: float
+    unit_weight_kg: float
+    space_consumption_rate: float
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    is_active: bool
+
+class OrderCartItem(BaseModel):
+    product_id: int
+    quantity: int = Field(default=1, ge=1)
+
 class OrderItemSchema(BaseModel):
     id: str
     order_id: int
@@ -55,12 +71,13 @@ class CreateOrderRequest(BaseModel):
     destination_hub: str # e.g. "CMB", "GAL", "Colombo"
     cargo_type: Optional[str] = "tea"
     cargo_description: Optional[str] = None
-    weight_kg: float = Field(default=25.0, gt=0)
+    weight_kg: Optional[float] = 25.0
     recipient_name: Optional[str] = None
     recipient_phone: Optional[str] = None
     delivery_address: Optional[str] = None
     booking_date: Optional[str] = None
     slot: Optional[str] = "06:30 AM Express Rail 101"
+    items: Optional[List[OrderCartItem]] = None
 
 class MilestoneSchema(BaseModel):
     title: str
@@ -376,10 +393,42 @@ def get_order_tracking(tracking_id: str):
             )
 
 
+@router.get("/catalogue", response_model=List[ProductCatalogueItem])
+def get_order_catalogue():
+    """
+    Returns active product catalogue grouped by categories with weights, space rates, and images.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT product_id, product_name, category, unit_price, unit_weight_kg,
+                       space_consumption_rate, description, image_url, is_active
+                FROM product
+                WHERE is_active = 1
+                ORDER BY category ASC, product_id ASC
+            """)
+            rows = cursor.fetchall()
+            return [
+                {
+                    "product_id": r["product_id"],
+                    "product_name": r["product_name"],
+                    "category": r["category"],
+                    "unit_price": float(r["unit_price"]),
+                    "unit_weight_kg": float(r["unit_weight_kg"]),
+                    "space_consumption_rate": float(r["space_consumption_rate"]),
+                    "description": r["description"],
+                    "image_url": r["image_url"],
+                    "is_active": bool(r["is_active"])
+                }
+                for r in rows
+            ]
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_consignment_order(payload: CreateOrderRequest, request: Request):
     """
-    Creates a new real customer consignment order in MySQL database.
+    Creates a new real customer consignment order in MySQL database with multi-item catalogue support,
+    and alerts all active Logistics Managers via automated freight dispatch notification.
     """
     token = get_token_from_request(request)
     session_user = decode_access_token(token) if token else None
@@ -414,6 +463,13 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 res = cursor.fetchone()
                 customer_id = res["customer_id"] if res else 1
 
+            # Fetch customer details for notification
+            cursor.execute("SELECT customer_name, phone, address_line, city FROM customer WHERE customer_id = %s", (customer_id,))
+            cust_row = cursor.fetchone() or {}
+            customer_display_name = payload.recipient_name or cust_row.get("customer_name") or "Lanka Freight Client"
+            customer_phone = payload.recipient_phone or cust_row.get("phone") or "0770000000"
+            delivery_addr = payload.delivery_address or cust_row.get("address_line") or hub_info["station"]
+
             # 2. Dates
             order_date = datetime.date.today()
             delivery_date = order_date + datetime.timedelta(days=2)
@@ -427,21 +483,54 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 (customer_id, order_date, delivery_date)
             )
             order_id = cursor.lastrowid
+            tracking_code = f"KP-{order_id:05d}-{hub_key}"
 
-            # 4. Insert order_item
-            # Select matching product
-            cursor.execute("SELECT product_id FROM product ORDER BY product_id ASC LIMIT 1")
-            prod = cursor.fetchone()
-            product_id = prod["product_id"] if prod else 1
-            qty = max(1, int(payload.weight_kg / 2))
+            # 4. Process Catalogue Items
+            total_weight_kg = 0.0
+            total_space_units = 0.0
+            total_goods_amount = 0.0
+            item_summaries = []
 
-            cursor.execute(
-                """
-                INSERT INTO order_item (order_id, product_id, quantity)
-                VALUES (%s, %s, %s)
-                """,
-                (order_id, product_id, qty)
-            )
+            if payload.items and len(payload.items) > 0:
+                # Load all products from DB for accurate calculations
+                cursor.execute("SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate FROM product")
+                prod_map = {p["product_id"]: p for p in cursor.fetchall()}
+
+                for item in payload.items:
+                    prod = prod_map.get(item.product_id)
+                    if prod:
+                        cursor.execute(
+                            """
+                            INSERT INTO order_item (order_id, product_id, quantity)
+                            VALUES (%s, %s, %s)
+                            """,
+                            (order_id, item.product_id, item.quantity)
+                        )
+                        item_weight = float(prod["unit_weight_kg"]) * item.quantity
+                        item_space = float(prod["space_consumption_rate"]) * item.quantity
+                        item_price = float(prod["unit_price"]) * item.quantity
+
+                        total_weight_kg += item_weight
+                        total_space_units += item_space
+                        total_goods_amount += item_price
+                        item_summaries.append(f"{prod['product_name']} (Qty: {item.quantity}, {item_weight:.1f}kg)")
+            else:
+                # Single/legacy item fallback
+                cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
+                prod = cursor.fetchone()
+                product_id = prod["product_id"] if prod else 1
+                qty = max(1, int((payload.weight_kg or 25) / 2))
+                cursor.execute(
+                    """
+                    INSERT INTO order_item (order_id, product_id, quantity)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (order_id, product_id, qty)
+                )
+                total_weight_kg = float(payload.weight_kg or 25.0)
+                total_space_units = float(prod["space_consumption_rate"]) * qty if prod else 0.5
+                total_goods_amount = float(prod["unit_price"]) * qty if prod else 3200.0
+                item_summaries.append(f"{payload.cargo_description or 'Ceylon Tea & Spices'} ({total_weight_kg}kg)")
 
             # 5. Insert order_status_history
             cursor.execute(
@@ -452,9 +541,91 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 (order_id,)
             )
 
+            # 6. Audit Log
+            try:
+                user_id_actor = int(session_user["sub"]) if session_user else 1
+                cursor.execute(
+                    """
+                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                    VALUES (%s, 'NEW_CONSIGNMENT_ORDER', %s, 'SUCCESS', 'customer_order')
+                    """,
+                    (user_id_actor, order_id)
+                )
+            except Exception as e:
+                print(f"[AUDIT LOG WARNING] {e}")
+
             conn.commit()
 
-            tracking_code = f"KP-{order_id:05d}-{hub_key}"
+            # 7. Notify Logistics Managers (Automated Alert)
+            notified_mgr_count = 0
+            cargo_summary_text = "; ".join(item_summaries)
+            try:
+                cursor.execute(
+                    """
+                    SELECT user_id, name, email 
+                    FROM user 
+                    WHERE role = 'LOGISTICS_MGR' AND is_active = 1
+                    """
+                )
+                logistics_mgrs = cursor.fetchall()
+                for mgr in logistics_mgrs:
+                    mgr_name = mgr["name"]
+                    mgr_email = mgr["email"]
+                    email_html = f"""
+                    <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #1e293b;">
+                        <h2 style="color: #166534; border-bottom: 2px solid #22c55e; padding-bottom: 8px;">
+                            🚂 Kandypack Freight Alert: New Consignment Booked
+                        </h2>
+                        <p>Dear <strong>{mgr_name}</strong>,</p>
+                        <p>A new customer consignment has been placed and is currently awaiting train carriage scheduling:</p>
+                        <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                            <tr style="background: #f0fdf4;">
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Tracking ID</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; color: #15803d; font-weight: bold;">{tracking_code}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Destination Hub</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;">{hub_info['city']} ({hub_info['station']})</td>
+                            </tr>
+                            <tr style="background: #f0fdf4;">
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Cargo Items</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;">{cargo_summary_text}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Total Weight</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;"><strong>{total_weight_kg:.1f} kg</strong></td>
+                            </tr>
+                            <tr style="background: #f0fdf4;">
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Rail Space Required</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;">{total_space_units:.3f} wagon units</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Consignment Value</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;">LKR {total_goods_amount:,.2f}</td>
+                            </tr>
+                            <tr style="background: #f0fdf4;">
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Recipient Contact</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;">{customer_display_name} ({customer_phone})</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0; font-weight: bold;">Delivery Address</td>
+                                <td style="padding: 8px; border: 1px solid #bbf7d0;">{delivery_addr}</td>
+                            </tr>
+                        </table>
+                        <p style="margin-top: 15px;">
+                            Please access the <strong>Kandypack Rail Allocation Module</strong> to assign this freight to an upcoming scheduled train departure.
+                        </p>
+                    </div>
+                    """
+                    log_and_dispatch_email(
+                        to_email=mgr_email,
+                        subject=f"New Consignment {tracking_code} Awaiting Rail Scheduling",
+                        html_content=email_html,
+                        notification_type="LOGISTICS_MGR_ALERT"
+                    )
+                    notified_mgr_count += 1
+            except Exception as e:
+                print(f"[LOGISTICS ALERT DISPATCH ERROR] {e}")
 
             return {
                 "order_id": order_id,
@@ -462,5 +633,9 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 "destination": hub_info["city"],
                 "hubStation": hub_info["station"],
                 "status": "pending",
-                "message": "Consignment booked successfully and recorded in database"
+                "total_weight_kg": round(total_weight_kg, 1),
+                "total_amount": round(total_goods_amount, 2),
+                "items_count": len(item_summaries),
+                "notified_managers": notified_mgr_count,
+                "message": f"Consignment {tracking_code} booked successfully! {notified_mgr_count} Logistics Manager(s) notified."
             }

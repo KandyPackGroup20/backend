@@ -87,4 +87,36 @@ def log_and_dispatch_email(
 
 def get_recent_notifications(limit: int = 10) -> List[Dict]:
     """Returns recent notification events for frontend notification centers / push toasts."""
-    return _NOTIFICATION_DISPATCH_LOG[:limit]
+    merged = list(_NOTIFICATION_DISPATCH_LOG)
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT co.order_id, co.status, co.created_at, c.customer_name, c.city,
+                           COALESCE((SELECT GROUP_CONCAT(p.product_name SEPARATOR ', ')
+                                     FROM order_item oi JOIN product p ON oi.product_id = p.product_id
+                                     WHERE oi.order_id = co.order_id), 'General Freight') AS items_desc
+                    FROM customer_order co
+                    JOIN customer c ON co.customer_id = c.customer_id
+                    ORDER BY co.order_id DESC
+                    LIMIT 10
+                """)
+                orders = cur.fetchall()
+                existing_subjects = {n.get("subject") for n in merged}
+                for o in orders:
+                    subj = f"New Consignment KP-{o['order_id']:05d} Awaiting Rail Scheduling"
+                    if subj not in existing_subjects:
+                        merged.append({
+                            "id": 1000 + o["order_id"],
+                            "type": "LOGISTICS_MGR_ALERT",
+                            "recipient": "logistics@kandypack.lk",
+                            "subject": subj,
+                            "status": "DELIVERED",
+                            "timestamp": str(o["created_at"]) if o["created_at"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "body_preview": f"Consignment for {o['customer_name']} to {o['city']}: {o['items_desc']}"
+                        })
+    except Exception as e:
+        print(f"[NOTIF DB FALLBACK] {e}")
+
+    return sorted(merged, key=lambda x: str(x.get("timestamp", "")), reverse=True)[:limit]

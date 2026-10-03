@@ -126,6 +126,8 @@ def login(payload: LoginRequest, response: Response):
             )
             
             return {
+                "access_token": access_token,
+                "token_type": "bearer",
                 "user_id": user['user_id'],
                 "email": user['email'],
                 "full_name": user['name'],

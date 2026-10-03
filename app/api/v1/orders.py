@@ -247,6 +247,37 @@ def list_customer_orders(request: Request, search: Optional[str] = None, status_
             return results
 
 
+@router.get("/catalogue", response_model=List[ProductCatalogueItem])
+def get_order_catalogue():
+    """
+    Returns active product catalogue grouped by categories with weights, space rates, and images.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT product_id, product_name, category, unit_price, unit_weight_kg,
+                       space_consumption_rate, description, image_url, is_active
+                FROM product
+                WHERE is_active = 1
+                ORDER BY category ASC, product_id ASC
+            """)
+            rows = cursor.fetchall()
+            return [
+                {
+                    "product_id": r["product_id"],
+                    "product_name": r["product_name"],
+                    "category": r["category"],
+                    "unit_price": float(r["unit_price"]),
+                    "unit_weight_kg": float(r["unit_weight_kg"]),
+                    "space_consumption_rate": float(r["space_consumption_rate"]),
+                    "description": r["description"],
+                    "image_url": r["image_url"],
+                    "is_active": bool(r["is_active"])
+                }
+                for r in rows
+            ]
+
+
 @router.get("/{tracking_id}", response_model=OrderTrackingResponse)
 def get_order_tracking(tracking_id: str):
     """
@@ -391,37 +422,6 @@ def get_order_tracking(tracking_id: str):
                 amount=amount,
                 milestones=milestones
             )
-
-
-@router.get("/catalogue", response_model=List[ProductCatalogueItem])
-def get_order_catalogue():
-    """
-    Returns active product catalogue grouped by categories with weights, space rates, and images.
-    """
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT product_id, product_name, category, unit_price, unit_weight_kg,
-                       space_consumption_rate, description, image_url, is_active
-                FROM product
-                WHERE is_active = 1
-                ORDER BY category ASC, product_id ASC
-            """)
-            rows = cursor.fetchall()
-            return [
-                {
-                    "product_id": r["product_id"],
-                    "product_name": r["product_name"],
-                    "category": r["category"],
-                    "unit_price": float(r["unit_price"]),
-                    "unit_weight_kg": float(r["unit_weight_kg"]),
-                    "space_consumption_rate": float(r["space_consumption_rate"]),
-                    "description": r["description"],
-                    "image_url": r["image_url"],
-                    "is_active": bool(r["is_active"])
-                }
-                for r in rows
-            ]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

@@ -18,12 +18,14 @@ logger = logging.getLogger("kandypack.notifications")
 _NOTIFICATION_DISPATCH_LOG: List[Dict] = [
     {
         "id": 1,
-        "type": "EMAIL",
+        "type": "ORDER_CONFIRMED",
         "recipient": "customer1@gmail.com",
         "subject": "Kandypack Order #1001 Confirmed",
         "status": "DELIVERED",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "body_preview": "Your order for FMCG Biscuits Master Carton (200 Units) is currently pending rail scheduling."
+        "body_preview": "Your order for FMCG Biscuits Master Carton (200 Units) is currently pending rail scheduling.",
+        "order_id": 1001,
+        "is_read": 1
     },
     {
         "id": 2,
@@ -32,7 +34,9 @@ _NOTIFICATION_DISPATCH_LOG: List[Dict] = [
         "subject": "Roster Assigned: Colombo Central Route",
         "status": "SENT",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "body_preview": "Driver Kasun assigned to Truck WP-CAB-1001 with Assistant Pathum."
+        "body_preview": "Driver Kasun assigned to Truck WP-CAB-1001 with Assistant Pathum.",
+        "order_id": None,
+        "is_read": 1
     }
 ]
 
@@ -85,38 +89,114 @@ def log_and_dispatch_email(
     print(f"   Time: {timestamp}")
     return True
 
-def get_recent_notifications(limit: int = 10) -> List[Dict]:
-    """Returns recent notification events for frontend notification centers / push toasts."""
-    merged = list(_NOTIFICATION_DISPATCH_LOG)
+def create_database_notification(
+    recipient_email: str,
+    title: str,
+    message: str,
+    notification_type: str = "NEW_CONSIGNMENT",
+    order_id: Optional[int] = None,
+    user_id: Optional[int] = None
+) -> Optional[int]:
+    """Inserts a real persistent alert into the MySQL notification table."""
     try:
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT co.order_id, co.status, co.created_at, c.customer_name, c.city,
-                           COALESCE((SELECT GROUP_CONCAT(p.product_name SEPARATOR ', ')
-                                     FROM order_item oi JOIN product p ON oi.product_id = p.product_id
-                                     WHERE oi.order_id = co.order_id), 'General Freight') AS items_desc
-                    FROM customer_order co
-                    JOIN customer c ON co.customer_id = c.customer_id
-                    ORDER BY co.order_id DESC
-                    LIMIT 10
-                """)
-                orders = cur.fetchall()
-                existing_subjects = {n.get("subject") for n in merged}
-                for o in orders:
-                    subj = f"New Consignment KP-{o['order_id']:05d} Awaiting Rail Scheduling"
-                    if subj not in existing_subjects:
-                        merged.append({
-                            "id": 1000 + o["order_id"],
-                            "type": "LOGISTICS_MGR_ALERT",
-                            "recipient": "logistics@kandypack.lk",
-                            "subject": subj,
-                            "status": "DELIVERED",
-                            "timestamp": str(o["created_at"]) if o["created_at"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "body_preview": f"Consignment for {o['customer_name']} to {o['city']}: {o['items_desc']}"
-                        })
+                cur.execute(
+                    """
+                    INSERT INTO notification 
+                    (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 0, NOW())
+                    """,
+                    (user_id, recipient_email, notification_type, title, message, order_id)
+                )
+                conn.commit()
+                return cur.lastrowid
     except Exception as e:
-        print(f"[NOTIF DB FALLBACK] {e}")
+        logger.error(f"Error creating DB notification: {e}")
+        return None
 
-    return sorted(merged, key=lambda x: str(x.get("timestamp", "")), reverse=True)[:limit]
+def get_recent_notifications(limit: int = 50, unread_only: bool = False, search: Optional[str] = None) -> List[Dict]:
+    """Returns real notification events from MySQL notification table."""
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                conditions = []
+                params = []
+                if unread_only:
+                    conditions.append("n.is_read = 0")
+                if search:
+                    conditions.append("(n.title LIKE %s OR n.message LIKE %s OR n.recipient_email LIKE %s)")
+                    term = f"%{search}%"
+                    params.extend([term, term, term])
+
+                where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                sql = f"""
+                    SELECT 
+                        n.notification_id AS id,
+                        n.notification_type AS type,
+                        n.recipient_email AS recipient,
+                        n.title AS subject,
+                        n.message AS body_preview,
+                        'DELIVERED' AS status,
+                        DATE_FORMAT(n.created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS timestamp,
+                        n.order_id,
+                        n.is_read,
+                        co.status AS order_status
+                    FROM notification n
+                    LEFT JOIN customer_order co ON n.order_id = co.order_id
+                    {where_clause}
+                    ORDER BY n.created_at DESC, n.notification_id DESC
+                    LIMIT %s
+                """
+                params.append(limit)
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+                if rows:
+                    return rows
+    except Exception as e:
+        logger.warning(f"Error reading DB notifications: {e}")
+
+    # Fallback to in-memory store if DB query fails
+    return _NOTIFICATION_DISPATCH_LOG[:limit]
+
+def get_unread_notification_count() -> int:
+    """Returns total count of unread notifications from database."""
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS cnt FROM notification WHERE is_read = 0")
+                res = cur.fetchone()
+                return res["cnt"] if res else 0
+    except Exception as e:
+        logger.warning(f"Error fetching unread count: {e}")
+        return 0
+
+def mark_notification_as_read(notification_id: int) -> bool:
+    """Marks a single alert as read in MySQL database."""
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE notification SET is_read = 1 WHERE notification_id = %s", (notification_id,))
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"Error marking notification {notification_id} as read: {e}")
+        return False
+
+def mark_all_notifications_as_read() -> int:
+    """Marks all unread alerts as read in MySQL database."""
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE notification SET is_read = 1 WHERE is_read = 0")
+                conn.commit()
+                return cur.rowcount
+    except Exception as e:
+        logger.error(f"Error marking all notifications as read: {e}")
+        return 0
+

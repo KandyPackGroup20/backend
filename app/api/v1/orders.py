@@ -617,13 +617,51 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                         </p>
                     </div>
                     """
+                    # 100% Real Database-Backed Alert for Logistics Manager
+                    title_text = f"New Consignment {tracking_code} Awaiting Rail Scheduling"
+                    msg_text = f"Consignment for {customer_display_name} to {hub_info['city']} ({hub_info['station']}): {cargo_summary_text}. Weight: {total_weight_kg:.1f} kg. Value: LKR {total_goods_amount:,.2f}."
+                    
+                    cursor.execute(
+                        """
+                        INSERT INTO notification 
+                        (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                        VALUES (%s, %s, 'NEW_CONSIGNMENT', %s, %s, %s, 0, NOW())
+                        """,
+                        (mgr["user_id"], mgr_email, title_text, msg_text, order_id)
+                    )
+
                     log_and_dispatch_email(
                         to_email=mgr_email,
-                        subject=f"New Consignment {tracking_code} Awaiting Rail Scheduling",
+                        subject=title_text,
                         html_content=email_html,
                         notification_type="LOGISTICS_MGR_ALERT"
                     )
                     notified_mgr_count += 1
+
+                # If customer is authenticated, also create customer notification
+                if session_user and session_user.get("sub"):
+                    try:
+                        cursor.execute("SELECT email FROM user WHERE user_id = %s", (session_user["sub"],))
+                        cust_user = cursor.fetchone()
+                        if cust_user:
+                            cursor.execute(
+                                """
+                                INSERT INTO notification 
+                                (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                                VALUES (%s, %s, 'ORDER_CONFIRMED', %s, %s, %s, 0, NOW())
+                                """,
+                                (
+                                    session_user["sub"],
+                                    cust_user["email"],
+                                    f"Kandypack Order #{order_id} Confirmed",
+                                    f"Your order for {cargo_summary_text} is confirmed and pending rail scheduling.",
+                                    order_id
+                                )
+                            )
+                    except Exception as ce:
+                        print(f"[CUSTOMER NOTIF WARNING] {ce}")
+
+                conn.commit()
             except Exception as e:
                 print(f"[LOGISTICS ALERT DISPATCH ERROR] {e}")
 

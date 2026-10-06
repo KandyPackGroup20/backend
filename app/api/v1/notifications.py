@@ -1,6 +1,7 @@
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query, Request
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
+from app.core.security import get_token_from_request, decode_access_token
 from app.core.notifications import (
     log_and_dispatch_email,
     get_recent_notifications,
@@ -23,47 +24,114 @@ class TriggerNotificationRequest(BaseModel):
 @router.get("/recent")
 @router.get("")
 def list_recent_notifications(
+    request: Request,
     limit: int = Query(50, ge=1, le=100),
     unread_only: bool = Query(False),
     search: Optional[str] = Query(None)
 ):
     """
-    Retrieves real-time dispatch alerts and history from MySQL notification table.
-    Returns list of notifications, current unread count, and total count.
+    Retrieves real-time dispatch alerts strictly scoped to the authenticated user's role.
+    Unauthenticated public visitors receive an empty list with authenticated=False.
     """
-    notifs = get_recent_notifications(limit=limit, unread_only=unread_only, search=search)
-    unread_cnt = get_unread_notification_count()
+    token = get_token_from_request(request)
+    session_user = decode_access_token(token) if token else None
+
+    if not session_user:
+        return {
+            "notifications": [],
+            "unread_count": 0,
+            "total_dispatched": 0,
+            "authenticated": False
+        }
+
+    user_id = int(session_user.get("sub", 0))
+    user_role = session_user.get("role")
+    user_email = session_user.get("email")
+
+    notifs = get_recent_notifications(
+        limit=limit,
+        unread_only=unread_only,
+        search=search,
+        user_id=user_id,
+        user_role=user_role,
+        user_email=user_email
+    )
+    unread_cnt = get_unread_notification_count(
+        user_id=user_id,
+        user_role=user_role,
+        user_email=user_email
+    )
     return {
         "notifications": notifs,
         "unread_count": unread_cnt,
-        "total_dispatched": len(notifs)
+        "total_dispatched": len(notifs),
+        "authenticated": True,
+        "role": user_role
     }
 
 @router.patch("/{notification_id}/read")
-def set_notification_read(notification_id: int):
-    """Marks a single alert as read in the database."""
-    success = mark_notification_as_read(notification_id)
+def set_notification_read(notification_id: int, request: Request):
+    """Marks a single alert as read with ownership verification."""
+    token = get_token_from_request(request)
+    session_user = decode_access_token(token) if token else None
+    if not session_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="NOT_AUTHENTICATED: Please log in to acknowledge alerts."
+        )
+
+    user_id = int(session_user.get("sub", 0))
+    user_role = session_user.get("role")
+    user_email = session_user.get("email")
+
+    success = mark_notification_as_read(
+        notification_id,
+        user_id=user_id,
+        user_role=user_role,
+        user_email=user_email
+    )
     if not success:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Notification #{notification_id} not found or already updated."
+            detail=f"Notification #{notification_id} not found or you are not authorized to update it."
         )
     return {
         "status": "SUCCESS",
         "notification_id": notification_id,
         "is_read": 1,
-        "unread_count": get_unread_notification_count()
+        "unread_count": get_unread_notification_count(
+            user_id=user_id,
+            user_role=user_role,
+            user_email=user_email
+        )
     }
 
 @router.post("/mark-all-read")
-def mark_all_read():
-    """Marks all unread alerts as read in the database."""
-    updated = mark_all_notifications_as_read()
+def mark_all_read(request: Request):
+    """Marks all unread alerts for the authenticated user as read."""
+    token = get_token_from_request(request)
+    session_user = decode_access_token(token) if token else None
+    if not session_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="NOT_AUTHENTICATED: Please log in to acknowledge alerts."
+        )
+
+    user_id = int(session_user.get("sub", 0))
+    user_role = session_user.get("role")
+    user_email = session_user.get("email")
+
+    updated = mark_all_notifications_as_read(
+        user_id=user_id,
+        user_role=user_role,
+        user_email=user_email
+    )
     return {
         "status": "SUCCESS",
         "marked_read_count": updated,
         "unread_count": 0
     }
+
 
 @router.post("/send")
 def send_notification(payload: TriggerNotificationRequest, background_tasks: BackgroundTasks):

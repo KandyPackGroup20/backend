@@ -116,14 +116,43 @@ def create_database_notification(
         logger.error(f"Error creating DB notification: {e}")
         return None
 
-def get_recent_notifications(limit: int = 50, unread_only: bool = False, search: Optional[str] = None) -> List[Dict]:
-    """Returns real notification events from MySQL notification table."""
+def get_recent_notifications(
+    limit: int = 50,
+    unread_only: bool = False,
+    search: Optional[str] = None,
+    user_id: Optional[int] = None,
+    user_role: Optional[str] = None,
+    user_email: Optional[str] = None
+) -> List[Dict]:
+    """Returns real notification events filtered strictly by role and user authorization."""
+    # Strict RBAC: Unauthenticated guests cannot see any private/logistics alerts
+    if not user_id and not user_role and not user_email:
+        return []
+
     try:
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
                 conditions = []
                 params = []
+
+                # Role-based scoping
+                if user_role in ("LOGISTICS_MGR", "SUPERADMIN", "ADMIN"):
+                    # Logistics managers & admins see logistics alerts and alerts addressed to them
+                    conditions.append("(n.recipient_email = 'logistics@kandypack.lk' OR n.user_id = %s OR n.recipient_email = %s)")
+                    params.extend([user_id, user_email])
+                elif user_role in ("DRIVER", "ASSISTANT"):
+                    # Staff only see roster and dispatch alerts assigned to them
+                    conditions.append("(n.user_id = %s OR n.recipient_email = %s)")
+                    params.extend([user_id, user_email])
+                elif user_role == "CUSTOMER":
+                    # Customers only see their own order confirmations
+                    conditions.append("(n.user_id = %s OR n.recipient_email = %s)")
+                    params.extend([user_id, user_email])
+                else:
+                    conditions.append("(n.user_id = %s OR n.recipient_email = %s)")
+                    params.extend([user_id, user_email])
+
                 if unread_only:
                     conditions.append("n.is_read = 0")
                 if search:
@@ -131,7 +160,7 @@ def get_recent_notifications(limit: int = 50, unread_only: bool = False, search:
                     term = f"%{search}%"
                     params.extend([term, term, term])
 
-                where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                where_clause = f"WHERE {' AND '.join(conditions)}"
                 sql = f"""
                     SELECT 
                         n.notification_id AS id,
@@ -152,51 +181,91 @@ def get_recent_notifications(limit: int = 50, unread_only: bool = False, search:
                 """
                 params.append(limit)
                 cur.execute(sql, tuple(params))
-                rows = cur.fetchall()
-                if rows:
-                    return rows
+                return cur.fetchall()
     except Exception as e:
         logger.warning(f"Error reading DB notifications: {e}")
+        return []
 
-    # Fallback to in-memory store if DB query fails
-    return _NOTIFICATION_DISPATCH_LOG[:limit]
+def get_unread_notification_count(
+    user_id: Optional[int] = None,
+    user_role: Optional[str] = None,
+    user_email: Optional[str] = None
+) -> int:
+    """Returns total count of unread notifications authorized strictly for this user."""
+    if not user_id and not user_role and not user_email:
+        return 0
 
-def get_unread_notification_count() -> int:
-    """Returns total count of unread notifications from database."""
     try:
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) AS cnt FROM notification WHERE is_read = 0")
+                conditions = ["is_read = 0"]
+                params = []
+
+                if user_role in ("LOGISTICS_MGR", "SUPERADMIN", "ADMIN"):
+                    conditions.append("(recipient_email = 'logistics@kandypack.lk' OR user_id = %s OR recipient_email = %s)")
+                    params.extend([user_id, user_email])
+                else:
+                    conditions.append("(user_id = %s OR recipient_email = %s)")
+                    params.extend([user_id, user_email])
+
+                cur.execute(f"SELECT COUNT(*) AS cnt FROM notification WHERE {' AND '.join(conditions)}", tuple(params))
                 res = cur.fetchone()
                 return res["cnt"] if res else 0
     except Exception as e:
         logger.warning(f"Error fetching unread count: {e}")
         return 0
 
-def mark_notification_as_read(notification_id: int) -> bool:
-    """Marks a single alert as read in MySQL database."""
+def mark_notification_as_read(
+    notification_id: int,
+    user_id: Optional[int] = None,
+    user_role: Optional[str] = None,
+    user_email: Optional[str] = None
+) -> bool:
+    """Marks a single alert as read with ownership verification."""
     try:
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE notification SET is_read = 1 WHERE notification_id = %s", (notification_id,))
+                conditions = ["notification_id = %s"]
+                params = [notification_id]
+
+                if user_role not in ("LOGISTICS_MGR", "SUPERADMIN", "ADMIN"):
+                    conditions.append("(user_id = %s OR recipient_email = %s)")
+                    params.extend([user_id, user_email])
+
+                cur.execute(f"UPDATE notification SET is_read = 1 WHERE {' AND '.join(conditions)}", tuple(params))
                 conn.commit()
                 return cur.rowcount > 0
     except Exception as e:
         logger.error(f"Error marking notification {notification_id} as read: {e}")
         return False
 
-def mark_all_notifications_as_read() -> int:
-    """Marks all unread alerts as read in MySQL database."""
+def mark_all_notifications_as_read(
+    user_id: Optional[int] = None,
+    user_role: Optional[str] = None,
+    user_email: Optional[str] = None
+) -> int:
+    """Marks all unread alerts authorized for this user as read."""
     try:
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE notification SET is_read = 1 WHERE is_read = 0")
+                conditions = ["is_read = 0"]
+                params = []
+
+                if user_role in ("LOGISTICS_MGR", "SUPERADMIN", "ADMIN"):
+                    conditions.append("(recipient_email = 'logistics@kandypack.lk' OR user_id = %s OR recipient_email = %s)")
+                    params.extend([user_id, user_email])
+                else:
+                    conditions.append("(user_id = %s OR recipient_email = %s)")
+                    params.extend([user_id, user_email])
+
+                cur.execute(f"UPDATE notification SET is_read = 1 WHERE {' AND '.join(conditions)}", tuple(params))
                 conn.commit()
                 return cur.rowcount
     except Exception as e:
         logger.error(f"Error marking all notifications as read: {e}")
         return 0
+
 

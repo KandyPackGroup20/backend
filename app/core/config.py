@@ -2,7 +2,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(".env", "backend/.env"),
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
     
     PROJECT_NAME: str = "Kandypack Logistics API"
     VERSION: str = "1.0.0"
@@ -17,5 +21,13 @@ class Settings(BaseSettings):
     MYSQL_USER: str = "root"
     MYSQL_PASSWORD: str = ""
     MYSQL_DATABASE: str = "kandypack_db"
+    
+    # Redis Cache & Rate Limiting Settings
+    REDIS_URL: str | None = None
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_PASSWORD: str | None = None
+    REDIS_SSL: bool = False
+    REDIS_ENABLED: bool = True
 
 settings = Settings()

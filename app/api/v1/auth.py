@@ -9,6 +9,12 @@ from app.core.security import (
     get_current_user,
     require_roles
 )
+from app.core.cache import (
+    check_rate_limit,
+    record_login_failure,
+    reset_login_failures
+)
+import pymysql
 
 router = APIRouter(prefix="/auth", tags=["Authentication & Identity (Feature 4.1)"])
 
@@ -60,149 +66,204 @@ class UserProfileResponse(BaseModel):
     address_line: Optional[str] = None
     route_id: Optional[int] = None
 
+class ProfileUpdateRequest(BaseModel):
+    name: str = Field(min_length=2)
+    phone: Optional[str] = None
+    city: Optional[str] = None
+    address_line: Optional[str] = None
+
     
 # 1. Login Endpoint (Strictly Parameterized / SQLi Protected)
     
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, response: Response):
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            # Policy 1: Enforce Staff Email Domain for Staff/Admin Portal
-            if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
-                )
+    # rate limit check
+    allowed, remaining = check_rate_limit(payload.email, max_attempts=5, window_seconds=60)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="TOO_MANY_FAILED_ATTEMPTS: Account temporarily locked due to excessive failed attempts. Please retry in 60 seconds."
+        )
 
-            # Policy 2: Strictly Parameterized Query (prevents SQL Injection)
-            cursor.execute(
-                """
-                SELECT user_id, email, password_hash, name, role, force_password_reset 
-                FROM user 
-                WHERE email = %s AND is_active = 1
-                """,
-                (payload.email,)
-            )
-            user = cursor.fetchone()
-            
-            if not user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED, 
-                    detail="ACCOUNT_NOT_FOUND: User does not exist or account is inactive."
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                # check staff email domain
+                if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
+                    )
+
+                # fetch user
+                cursor.execute(
+                    """
+                    SELECT user_id, email, password_hash, name, role, force_password_reset 
+                    FROM user 
+                    WHERE email = %s AND is_active = 1
+                    """,
+                    (payload.email,)
                 )
-            
-            # Policy 3: Verify Password Hash
-            if not verify_password(payload.password, user['password_hash']) and payload.password != "password123":
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED, 
-                    detail="INVALID_CREDENTIALS: Incorrect email or password."
+                user = cursor.fetchone()
+                
+                if not user:
+                    record_login_failure(payload.email, window_seconds=60)
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED, 
+                        detail="ACCOUNT_NOT_FOUND: User does not exist or account is inactive."
+                    )
+                
+                # verify password
+                if not verify_password(payload.password, user['password_hash']) and payload.password != "password123":
+                    fails = record_login_failure(payload.email, window_seconds=60)
+                    rem = max(0, 5 - fails)
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED, 
+                        detail=f"INVALID_CREDENTIALS: Incorrect email or password. ({rem} attempt(s) remaining)"
+                    )
+                
+                reset_login_failures(payload.email)
+
+                # restrict customer from admin portal
+                if payload.portal_type == "admin" and user['role'] == "CUSTOMER":
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="CUSTOMER_ACCESS_DENIED: Customer accounts cannot access the internal admin portal."
+                    )
+                
+                # Generate JWT Session
+                force_reset = bool(user['force_password_reset'])
+                access_token = create_access_token(data={
+                    "sub": str(user['user_id']),
+                    "email": user['email'],
+                    "name": user['name'],
+                    "role": user['role'],
+                    "force_password_reset": force_reset
+                })
+                
+                # Set HttpOnly Session Cookie
+                response.set_cookie(
+                    key="kandypack_session",
+                    value=access_token,
+                    httponly=True,
+                    samesite="lax",
+                    secure=False,
+                    max_age=3600 * 24 # 24 Hours
                 )
-            
-            # Policy 4 (REQ-2): Customer Login Barrier Check
-            if payload.portal_type == "admin" and user['role'] == "CUSTOMER":
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="CUSTOMER_ACCESS_DENIED: Customer accounts cannot access the internal admin portal."
-                )
-            
-            # Generate JWT Session
-            force_reset = bool(user['force_password_reset'])
-            access_token = create_access_token(data={
-                "sub": str(user['user_id']),
-                "email": user['email'],
-                "name": user['name'],
-                "role": user['role'],
-                "force_password_reset": force_reset
-            })
-            
-            # Set HttpOnly Session Cookie
-            response.set_cookie(
-                key="kandypack_session",
-                value=access_token,
-                httponly=True,
-                samesite="lax",
-                secure=False,
-                max_age=3600 * 24 # 24 Hours
-            )
-            
-            return {
-                "access_token": access_token,
-                "token_type": "bearer",
-                "user_id": user['user_id'],
-                "email": user['email'],
-                "full_name": user['name'],
-                "role": user['role'],
-                "force_password_reset": force_reset,
-                "message": "Login successful"
-            }
+                return {
+                    "access_token": access_token,
+                    "token_type": "bearer",
+                    "user_id": user['user_id'],
+                    "email": user['email'],
+                    "full_name": user['name'],
+                    "role": user['role'],
+                    "force_password_reset": force_reset,
+                    "message": "Login successful"
+                }
+    except HTTPException:
+        raise
+    except pymysql.OperationalError as op_err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"DATABASE_UNAVAILABLE: Database connection failed. Please ensure the cloud database service is online and active. ({op_err})"
+        )
+    except pymysql.MySQLError as sql_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"DATABASE_ERROR: {str(sql_err)}"
+        )
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"LOGIN_FAILED: {str(err)}"
+        )
+
 
     
 # 2. Customer Registration Endpoint (Atomic Transaction & Parameterized)
     
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 def register_customer(payload: CustomerRegisterRequest, response: Response):
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id FROM user WHERE email = %s", (payload.email,))
-            if cursor.fetchone():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="EMAIL_EXISTS: An account with this email address already exists."
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT user_id FROM user WHERE email = %s", (payload.email,))
+                if cursor.fetchone():
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="EMAIL_EXISTS: An account with this email address already exists."
+                    )
+
+                pw_hash = get_password_hash(payload.password)
+                cursor.execute(
+                    """
+                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
+                    VALUES (%s, 'CUSTOMER', %s, %s, 0, 1)
+                    """,
+                    (payload.name, payload.email, pw_hash)
+                )
+                user_id = cursor.lastrowid
+
+                cursor.execute(
+                    """
+                    INSERT INTO customer (user_id, customer_name, route_id, phone, address_line, city, postal_code)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user_id,
+                        payload.name,
+                        payload.route_id,
+                        payload.phone,
+                        payload.address_line,
+                        payload.city,
+                        payload.postal_code
+                    )
+                )
+                customer_id = cursor.lastrowid
+                conn.commit()
+
+                access_token = create_access_token(data={
+                    "sub": str(user_id),
+                    "email": payload.email,
+                    "name": payload.name,
+                    "role": "CUSTOMER",
+                    "force_password_reset": False
+                })
+
+                response.set_cookie(
+                    key="kandypack_session",
+                    value=access_token,
+                    httponly=True,
+                    samesite="lax",
+                    secure=False,
+                    max_age=3600 * 24
                 )
 
-            pw_hash = get_password_hash(payload.password)
-            cursor.execute(
-                """
-                INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
-                VALUES (%s, 'CUSTOMER', %s, %s, 0, 1)
-                """,
-                (payload.name, payload.email, pw_hash)
-            )
-            user_id = cursor.lastrowid
-
-            cursor.execute(
-                """
-                INSERT INTO customer (user_id, customer_name, route_id, phone, address_line, city, postal_code)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    user_id,
-                    payload.name,
-                    payload.route_id,
-                    payload.phone,
-                    payload.address_line,
-                    payload.city,
-                    payload.postal_code
-                )
-            )
-            customer_id = cursor.lastrowid
-            conn.commit()
-
-            access_token = create_access_token(data={
-                "sub": str(user_id),
-                "email": payload.email,
-                "name": payload.name,
-                "role": "CUSTOMER",
-                "force_password_reset": False
-            })
-
-            response.set_cookie(
-                key="kandypack_session",
-                value=access_token,
-                httponly=True,
-                samesite="lax",
-                secure=False,
-                max_age=3600 * 24
-            )
-
-            return {
-                "user_id": user_id,
-                "customer_id": customer_id,
-                "name": payload.name,
-                "email": payload.email,
-                "role": "CUSTOMER",
-                "message": "Customer registered successfully"
-            }
+                return {
+                    "user_id": user_id,
+                    "customer_id": customer_id,
+                    "name": payload.name,
+                    "email": payload.email,
+                    "role": "CUSTOMER",
+                    "message": "Customer registered successfully"
+                }
+    except HTTPException:
+        raise
+    except pymysql.OperationalError as op_err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"DATABASE_UNAVAILABLE: Database connection failed. Please ensure the cloud database service is online and active. ({op_err})"
+        )
+    except pymysql.MySQLError as sql_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"DATABASE_ERROR: {str(sql_err)}"
+        )
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"REGISTRATION_FAILED: {str(err)}"
+        )
 
     
 # 3. Superadmin: Create New Employee / Staff Account (Guarded by SUPERADMIN role)
@@ -225,11 +286,17 @@ def create_staff_user(
             pw_hash = get_password_hash(payload.password)
 
             try:
-                # Trigger trg_user_account_creation_policy enforces domain check and force_password_reset = 1
+                # Enforce domain check and explicitly set force_password_reset = 1 for staff accounts
+                if not payload.email.endswith("@kandypack.lk"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="SECURITY POLICY VIOLATION: Internal staff users must have an email ending with @kandypack.lk"
+                    )
+
                 cursor.execute(
                     """
-                    INSERT INTO user (name, role, email, password_hash)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
+                    VALUES (%s, %s, %s, %s, 1, 1)
                     """,
                     (payload.name, payload.role, payload.email, pw_hash)
                 )
@@ -352,6 +419,90 @@ def get_current_user_profile(current_user: dict = Depends(get_current_user)):
             profile = cursor.fetchone()
             if not profile:
                 raise HTTPException(status_code=404, detail="User not found")
+
+            return {
+                "user_id": profile["user_id"],
+                "name": profile["name"],
+                "email": profile["email"],
+                "role": profile["role"],
+                "force_password_reset": bool(profile["force_password_reset"]),
+                "customer_id": profile.get("customer_id"),
+                "phone": profile.get("phone"),
+                "city": profile.get("city"),
+                "address_line": profile.get("address_line"),
+                "route_id": profile.get("route_id")
+            }
+
+@router.put("/me", response_model=UserProfileResponse)
+def update_current_user_profile(
+    payload: ProfileUpdateRequest,
+    response: Response,
+    current_user: dict = Depends(get_current_user)
+):
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            # Update user table name
+            cursor.execute(
+                "UPDATE user SET name = %s WHERE user_id = %s",
+                (payload.name, current_user["user_id"])
+            )
+
+            # Upsert into customer table so all accounts (staff and customers) have persistent contact details
+            phone_val = payload.phone or "0770000000"
+            addr_val = payload.address_line or "Kandy Logistics Central Store"
+            city_val = payload.city or "Colombo"
+
+            cursor.execute(
+                """
+                INSERT INTO customer (user_id, customer_name, route_id, phone, address_line, city, postal_code)
+                VALUES (%s, %s, 1, %s, %s, %s, '20000')
+                ON DUPLICATE KEY UPDATE 
+                    customer_name = VALUES(customer_name),
+                    phone = VALUES(phone),
+                    address_line = VALUES(address_line),
+                    city = VALUES(city)
+                """,
+                (
+                    current_user["user_id"],
+                    payload.name,
+                    phone_val,
+                    addr_val,
+                    city_val
+                )
+            )
+            conn.commit()
+
+            cursor.execute(
+                """
+                SELECT u.user_id, u.name, u.email, u.role, u.force_password_reset,
+                       c.customer_id, c.phone, c.city, c.address_line, c.route_id
+                FROM user u
+                LEFT JOIN customer c ON u.user_id = c.user_id
+                WHERE u.user_id = %s AND u.is_active = 1
+                """,
+                (current_user["user_id"],)
+            )
+            profile = cursor.fetchone()
+            if not profile:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Refresh token with updated name
+            new_token = create_access_token(data={
+                "sub": str(current_user["user_id"]),
+                "email": current_user["email"],
+                "name": profile["name"],
+                "role": current_user["role"],
+                "force_password_reset": bool(profile["force_password_reset"])
+            })
+
+            response.set_cookie(
+                key="kandypack_session",
+                value=new_token,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                max_age=3600 * 24
+            )
 
             return {
                 "user_id": profile["user_id"],

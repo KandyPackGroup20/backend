@@ -37,7 +37,7 @@ def require_roster_reader(
 
 
 def require_roster_writer(
-    user: dict = Depends(require_roles(["DISPATCHER", "SUPERADMIN"])),
+    user: dict = Depends(require_roles(["DISPATCHER", "SUPERADMIN", "LOGISTICS_MGR"])),
 ) -> dict:
     return _require_reset_complete(user)
 

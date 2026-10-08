@@ -88,6 +88,7 @@ def _colombo() -> ZoneInfo:
 def _instant(value: datetime, *, code: str = "INVALID_ASSIGNMENT_INTERVAL") -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         _violation(code, "Roster timestamps require an explicit timezone offset.")
+    
     if value.microsecond:
         _violation(code, "Roster timestamps require whole-second precision.")
     try:
@@ -174,7 +175,7 @@ class DemoV1RosterPolicy:
             _violation("ROUTE_MAX_DURATION_EXCEEDED", "Scheduled duration exceeds the route maximum.")
 
         active_history = _active(roster.assignments)
-        self._check_overlaps(active_history, proposal, start_utc, end_utc)
+        self._check_overlaps(active_history, proposal, start_utc, end_utc, staff_by_id)
         self._check_consecutive(active_history, proposal, staff_by_id)
         self._check_weekly_caps(active_history, proposal, staff_by_id)
         return PolicyValidationResult(duration_seconds=duration_seconds)
@@ -182,7 +183,10 @@ class DemoV1RosterPolicy:
     @staticmethod
     def _check_overlaps(
         history: tuple[Assignment, ...], proposal: AssignmentProposal, start_utc: datetime, end_utc: datetime,
+        staff_by_id: dict[int, Staff | PolicyStaff],
     ) -> None:
+        driver_person = _person_key(proposal.driver_id, staff_by_id)
+        assistant_person = _person_key(proposal.assistant_id, staff_by_id)
         for assignment in history:
             existing_start, existing_end = _interval(
                 assignment.start_time, assignment.end_time, code="INVALID_HISTORY_INTERVAL",
@@ -191,9 +195,13 @@ class DemoV1RosterPolicy:
                 continue
             if assignment.truck_id == proposal.truck_id:
                 _violation("TRUCK_OVERLAP", "Truck is already assigned during this interval.")
-            if assignment.driver_id == proposal.driver_id:
+            assigned_people = {
+                _person_key(assignment.driver_id, staff_by_id),
+                _person_key(assignment.assistant_id, staff_by_id),
+            }
+            if driver_person in assigned_people:
                 _violation("DRIVER_OVERLAP", "Driver is already assigned during this interval.")
-            if assignment.assistant_id == proposal.assistant_id:
+            if assistant_person in assigned_people:
                 _violation("ASSISTANT_OVERLAP", "Assistant is already assigned during this interval.")
 
     def _check_consecutive(
@@ -252,15 +260,14 @@ class DemoV1RosterPolicy:
     ) -> None:
         proposal_staff_id = proposal.driver_id if role == "driver" else proposal.assistant_id
         target_person = _person_key(proposal_staff_id, staff_by_id)
-        weekly_seconds: dict[date, int] = {}
+        weekly_seconds = split_colombo_duration(proposal.start_time, proposal.end_time)
         for assignment in history:
             staff_id = assignment.driver_id if role == "driver" else assignment.assistant_id
             if _person_key(staff_id, staff_by_id) != target_person:
                 continue
             for week, seconds in split_colombo_duration(assignment.start_time, assignment.end_time).items():
-                weekly_seconds[week] = weekly_seconds.get(week, 0) + seconds
-        for week, seconds in split_colombo_duration(proposal.start_time, proposal.end_time).items():
-            weekly_seconds[week] = weekly_seconds.get(week, 0) + seconds
+                if week in weekly_seconds:
+                    weekly_seconds[week] += seconds
         if any(seconds > limit for seconds in weekly_seconds.values()):
             if role == "driver":
                 _violation("DRIVER_WEEKLY_CAP_EXCEEDED", "Driver scheduled time exceeds the 40-hour weekly limit.")

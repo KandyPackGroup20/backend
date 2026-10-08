@@ -499,16 +499,17 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 for item in payload.items:
                     prod = prod_map.get(item.product_id)
                     if prod:
+                        unit_price = float(prod["unit_price"])
                         cursor.execute(
                             """
-                            INSERT INTO order_item (order_id, product_id, quantity)
-                            VALUES (%s, %s, %s)
+                            INSERT INTO order_item (order_id, product_id, quantity, unit_price_at_order)
+                            VALUES (%s, %s, %s, %s)
                             """,
-                            (order_id, item.product_id, item.quantity)
+                            (order_id, item.product_id, item.quantity, unit_price)
                         )
                         item_weight = float(prod["unit_weight_kg"]) * item.quantity
                         item_space = float(prod["space_consumption_rate"]) * item.quantity
-                        item_price = float(prod["unit_price"]) * item.quantity
+                        item_price = unit_price * item.quantity
 
                         total_weight_kg += item_weight
                         total_space_units += item_space
@@ -519,17 +520,18 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
                 prod = cursor.fetchone()
                 product_id = prod["product_id"] if prod else 1
+                fallback_price = float(prod["unit_price"]) if prod else 3200.0
                 qty = max(1, int((payload.weight_kg or 25) / 2))
                 cursor.execute(
                     """
-                    INSERT INTO order_item (order_id, product_id, quantity)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO order_item (order_id, product_id, quantity, unit_price_at_order)
+                    VALUES (%s, %s, %s, %s)
                     """,
-                    (order_id, product_id, qty)
+                    (order_id, product_id, qty, fallback_price)
                 )
                 total_weight_kg = float(payload.weight_kg or 25.0)
                 total_space_units = float(prod["space_consumption_rate"]) * qty if prod else 0.5
-                total_goods_amount = float(prod["unit_price"]) * qty if prod else 3200.0
+                total_goods_amount = fallback_price * qty
                 item_summaries.append(f"{payload.cargo_description or 'Ceylon Tea & Spices'} ({total_weight_kg}kg)")
 
             # 5. Insert order_status_history

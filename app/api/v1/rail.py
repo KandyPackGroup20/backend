@@ -34,6 +34,10 @@ RESULT_HTTP_STATUS = {
 
 class RailAllocateRequest(BaseModel):
     order_id: int
+    trip_id: Optional[int] = None
+
+class ReverseAllocateRequest(BaseModel):
+    order_id: int
 
 class CreateTripRequest(BaseModel):
     origin_station_id: int
@@ -537,32 +541,111 @@ def allocate_rail_capacity(
     payload: RailAllocateRequest,
     current_user: dict = Depends(require_roles(RAIL_ROLES)),
 ):
-    """Execute row-locked rail capacity allocation and multi-trip spillover (Feature 4.2)."""
+    """Execute row-locked rail capacity allocation: specific chosen trip or multi-trip spillover."""
     with get_db() as conn:
         with conn.cursor() as cursor:
             status_code = "UNKNOWN"
-            for _ in range(3):  # retry if MySQL reports a deadlock / lock timeout
+            if payload.trip_id:
+                # Direct allocation to user's explicitly selected train
                 cursor.execute(
-                    "CALL sp_schedule_train_order(%s, %s, @status_result);",
-                    (payload.order_id, current_user["user_id"]),
+                    """
+                    SELECT tt.trip_id, tt.origin_station_id, tt.destination_station_id,
+                           tt.departure_datetime, tt.arrival_datetime,
+                           fn_trip_remaining_capacity(tt.trip_id) AS remaining_space
+                    FROM train_trip tt
+                    WHERE tt.trip_id = %s AND tt.status = 'SCHEDULED'
+                    FOR UPDATE
+                    """,
+                    (payload.trip_id,)
                 )
-                cursor.execute("SELECT @status_result AS status_result;")
-                res = cursor.fetchone()
-                status_code = res["status_result"] if res else "UNKNOWN"
-                if status_code != "DEADLOCK_RETRY":
-                    break
+                trip = cursor.fetchone()
+                if not trip:
+                    raise HTTPException(status_code=404, detail="Selected train trip not found or not scheduled.")
 
-            if not status_code.startswith("SUCCESS"):
-                conn.rollback()
-                raise HTTPException(
-                    status_code=RESULT_HTTP_STATUS.get(status_code, 500),
-                    detail=f"Rail allocation failed: {status_code}",
+                cursor.execute(
+                    """
+                    SELECT co.status, co.delivery_date, dr.station_id AS dest_station_id
+                    FROM customer_order co
+                    JOIN customer c ON c.customer_id = co.customer_id
+                    JOIN delivery_route dr ON dr.route_id = c.route_id
+                    WHERE co.order_id = %s
+                    FOR UPDATE
+                    """,
+                    (payload.order_id,)
                 )
+                ord_info = cursor.fetchone()
+                if not ord_info:
+                    raise HTTPException(status_code=404, detail="Order not found in database.")
+                if ord_info["status"] != "PENDING_RAIL_SCHEDULING":
+                    raise HTTPException(status_code=409, detail="Order is not in PENDING_RAIL_SCHEDULING.")
+                if ord_info["dest_station_id"] != trip["destination_station_id"]:
+                    raise HTTPException(status_code=400, detail="Train destination does not match order delivery destination.")
+
+                cursor.execute(
+                    """
+                    SELECT oi.order_item_id, oi.quantity, p.space_consumption_rate,
+                           (oi.quantity * p.space_consumption_rate) AS item_space
+                    FROM order_item oi
+                    JOIN product p ON p.product_id = oi.product_id
+                    WHERE oi.order_id = %s
+                    """,
+                    (payload.order_id,)
+                )
+                items = cursor.fetchall()
+                total_needed = sum(float(i["item_space"]) for i in items)
+
+                if float(trip["remaining_space"]) < total_needed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Selected train only has {float(trip['remaining_space']):.1f} space units available, but order requires {total_needed:.1f} units. Use Auto Multi-Trip Spillover to split across multiple trains."
+                    )
+
+                for it in items:
+                    cursor.execute(
+                        """
+                        INSERT INTO rail_allocation (order_item_id, trip_id, allocated_quantity, allocated_space, allocated_by)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (it["order_item_id"], payload.trip_id, it["quantity"], it["item_space"], current_user["user_id"])
+                    )
+
+                cursor.execute(
+                    "UPDATE customer_order SET status = 'SCHEDULED_FOR_RAIL' WHERE order_id = %s",
+                    (payload.order_id,)
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                    VALUES (%s, 'SCHEDULE_RAIL_ORDER', %s, 'SUCCESS_SINGLE_TRIP', 'customer_order')
+                    """,
+                    (current_user["user_id"], payload.order_id)
+                )
+                status_code = "SUCCESS_SINGLE_TRIP"
+            else:
+                # Multi-trip spillover algorithm
+                for _ in range(3):  # retry if MySQL reports a deadlock / lock timeout
+                    cursor.execute(
+                        "CALL sp_schedule_train_order(%s, %s, @status_result);",
+                        (payload.order_id, current_user["user_id"]),
+                    )
+                    cursor.execute("SELECT @status_result AS status_result;")
+                    res = cursor.fetchone()
+                    status_code = res["status_result"] if res else "UNKNOWN"
+                    if status_code != "DEADLOCK_RETRY":
+                        break
+
+                if not status_code.startswith("SUCCESS"):
+                    conn.rollback()
+                    raise HTTPException(
+                        status_code=RESULT_HTTP_STATUS.get(status_code, 500),
+                        detail=f"Rail allocation failed: {status_code}",
+                    )
 
             conn.commit()
             invalidate_cache("cache:rail:")
 
-            # Allocation breakdown for presentation (LM-19)
+            # Allocation breakdown for presentation
             cursor.execute(
                 """
                 SELECT ra.allocation_id, oi.order_id, tt.trip_id, tt.departure_datetime,
@@ -592,7 +675,7 @@ def reverse_rail_allocation(
     order_id: int,
     current_user: dict = Depends(require_roles(RAIL_ROLES)),
 ):
-    """Reverse rail allocations for an order, releasing trip capacity and resetting status (LM-18)."""
+    """Reverse rail allocations for an order, releasing trip capacity and resetting status."""
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -618,6 +701,15 @@ def reverse_rail_allocation(
                 "status_result": status_code,
                 "message": f"Rail allocations for Order #{order_id} successfully reversed. Order status returned to PENDING_RAIL_SCHEDULING."
             }
+
+
+@router.post("/allocate/reverse")
+def reverse_rail_allocation_alias(
+    payload: ReverseAllocateRequest,
+    current_user: dict = Depends(require_roles(RAIL_ROLES)),
+):
+    """Alias for reverse rail allocation accepting JSON body."""
+    return reverse_rail_allocation(payload.order_id, current_user)
 
 
 # ==========================================

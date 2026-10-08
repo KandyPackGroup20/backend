@@ -472,7 +472,13 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
 
             # 2. Dates
             order_date = datetime.date.today()
-            delivery_date = order_date + datetime.timedelta(days=2)
+            if payload.booking_date:
+                try:
+                    delivery_date = datetime.date.fromisoformat(payload.booking_date)
+                except Exception:
+                    delivery_date = order_date + datetime.timedelta(days=7)
+            else:
+                delivery_date = order_date + datetime.timedelta(days=7)
 
             # 3. Insert customer_order
             cursor.execute(

@@ -88,13 +88,6 @@ def login(payload: LoginRequest, response: Response):
     try:
         with get_db() as conn:
             with conn.cursor() as cursor:
-                # check staff email domain
-                if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
-                    )
-
                 # fetch user
                 cursor.execute(
                     """
@@ -129,6 +122,13 @@ def login(payload: LoginRequest, response: Response):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="CUSTOMER_ACCESS_DENIED: Customer accounts cannot access the internal admin portal."
+                    )
+
+                # check staff email domain
+                if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
                     )
                 
                 # Generate JWT Session

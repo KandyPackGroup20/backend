@@ -129,7 +129,7 @@ class LiveRosterAuditTests(unittest.TestCase):
         hours = self.client.get("/api/v1/roster/hours?week_start=2026-09-21", headers=self.auth())
         self.assertEqual(hours.status_code, 200, hours.text)
         self.assertEqual([row["scheduled_seconds"] for row in hours.json()["hours"]], [3600, 3600])
-        report = self.client.get("/api/v1/reports/audit-logs")
+        report = self.client.get("/api/v1/reports/audit-logs", headers=self.auth(actor=1, role="SUPERADMIN"))
         self.assertEqual(report.status_code, 200, report.text)
         self.assertEqual(len(report.json()["audit_logs"]), 1)
         with schema.isolated_connection() as connection:
@@ -173,7 +173,7 @@ class LiveRosterAuditTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         attempts = response.json()["attempts"]
         self.assertEqual(attempts, [])
-        self.assertEqual(len(self.client.get("/api/v1/reports/audit-logs").json()["audit_logs"]), 3)
+        self.assertEqual(len(self.client.get("/api/v1/reports/audit-logs", headers=self.auth(actor=1, role="SUPERADMIN")).json()["audit_logs"]), 3)
 
     def test_real_audit_insert_failure_rolls_back_acceptance_but_does_not_mask_rejection(self):
         with schema.isolated_connection() as connection:

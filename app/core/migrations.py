@@ -165,7 +165,7 @@ def run_migrations():
                             SUM(ra.allocated_space) AS total_cubic_meters_shipped
                         FROM customer_order co
                         JOIN customer c ON co.customer_id = c.customer_id
-                        LEFT JOIN delivery_route dr ON c.route_id = dr.route_id
+                        LEFT JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
                         LEFT JOIN station_store ss ON dr.station_id = ss.station_id
                         JOIN order_item oi ON co.order_id = oi.order_id
                         JOIN rail_allocation ra ON oi.order_item_id = ra.order_item_id
@@ -307,7 +307,7 @@ def run_migrations():
                         FROM customer_order co
                         JOIN customer c ON co.customer_id = c.customer_id
                         JOIN user u ON c.user_id = u.user_id
-                        LEFT JOIN delivery_route dr ON c.route_id = dr.route_id
+                        LEFT JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
                         LEFT JOIN station_store ss ON dr.station_id = ss.station_id;
                     """)
                 except Exception as e:

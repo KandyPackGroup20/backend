@@ -3,9 +3,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 import datetime
 import re
+from zoneinfo import ZoneInfo
 
 from app.core.database import get_db
-from app.core.security import get_token_from_request, decode_access_token
+from app.core.security import get_token_from_request, decode_access_token, require_roles
 from app.core.notifications import log_and_dispatch_email
 
 router = APIRouter(prefix="/orders", tags=["Customer Orders & Consignments"])
@@ -72,9 +73,9 @@ class CreateOrderRequest(BaseModel):
     cargo_type: Optional[str] = "tea"
     cargo_description: Optional[str] = None
     weight_kg: Optional[float] = 25.0
-    recipient_name: Optional[str] = None
-    recipient_phone: Optional[str] = None
-    delivery_address: Optional[str] = None
+    recipient_name: Optional[str] = Field(default=None, max_length=255)
+    recipient_phone: Optional[str] = Field(default=None, max_length=30)
+    delivery_address: Optional[str] = Field(default=None, max_length=500)
     booking_date: Optional[str] = None
     slot: Optional[str] = "06:30 AM Express Rail 101"
     items: Optional[List[OrderCartItem]] = None
@@ -102,34 +103,6 @@ class OrderTrackingResponse(BaseModel):
     milestones: List[MilestoneSchema]
 
 
-def ensure_seed_orders(conn):
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as cnt FROM customer_order")
-            res = cur.fetchone()
-            if res and res["cnt"] <= 1:
-                orders = [
-                    (1002, 1, '2026-09-03', '2026-09-05', 'DELIVERED', 2, 45),
-                    (1003, 1, '2026-09-05', '2026-09-08', 'PENDING_RAIL_SCHEDULING', 1, 80),
-                    (1004, 2, '2026-09-02', '2026-09-04', 'DELIVERED', 3, 100),
-                    (1005, 2, '2026-09-01', '2026-09-03', 'DELIVERED', 1, 150),
-                    (1006, 1, '2026-08-30', '2026-09-02', 'ISSUE_DELAYED', 4, 30),
-                    (1007, 1, '2026-09-04', '2026-09-06', 'SCHEDULED_FOR_RAIL', 1, 120),
-                ]
-                for oid, cid, odate, ddate, st, pid, qty in orders:
-                    cur.execute(
-                        "INSERT INTO customer_order (order_id, customer_id, order_date, delivery_date, status) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE status=%s",
-                        (oid, cid, odate, ddate, st, st)
-                    )
-                    cur.execute(
-                        "INSERT IGNORE INTO order_item (order_item_id, order_id, product_id, quantity) VALUES (%s, %s, %s, %s)",
-                        (oid, oid, pid, qty)
-                    )
-                conn.commit()
-    except Exception:
-        pass
-
-
 @router.get("", response_model=List[OrderItemSchema])
 def list_customer_orders(request: Request, search: Optional[str] = None, status_filter: Optional[str] = None):
     """
@@ -140,7 +113,6 @@ def list_customer_orders(request: Request, search: Optional[str] = None, status_
     session_user = decode_access_token(token) if token else None
 
     with get_db() as conn:
-        ensure_seed_orders(conn)
         with conn.cursor() as cursor:
             # Determine customer filtering
             where_clauses = ["1=1"]
@@ -162,12 +134,12 @@ def list_customer_orders(request: Request, search: Optional[str] = None, status_
                     co.delivery_date,
                     co.status AS raw_status,
                     co.created_at,
-                    c.customer_name,
-                    c.phone AS customer_phone,
-                    c.address_line,
+                    co.recipient_name AS customer_name,
+                    co.recipient_phone AS customer_phone,
+                    co.delivery_address AS address_line,
                     c.city AS customer_city,
-                    COALESCE(dest_ss.city, ss.city, c.city, 'Colombo') AS destination_city,
-                    COALESCE(dest_ss.address, ss.address, 'Colombo Fort Goods Shed') AS hub_address,
+                    ss.city AS destination_city,
+                    ss.address AS hub_address,
                     COALESCE(
                         (SELECT GROUP_CONCAT(CONCAT(p.product_name) SEPARATOR ', ')
                          FROM order_item oi JOIN product p ON oi.product_id = p.product_id
@@ -175,13 +147,13 @@ def list_customer_orders(request: Request, search: Optional[str] = None, status_
                         'Highland Tea & Spices'
                     ) AS cargo_name,
                     COALESCE(
-                        (SELECT ROUND(SUM(oi.quantity * p.space_consumption_rate * 50), 0)
+                        (SELECT ROUND(SUM(oi.quantity * p.unit_weight_kg), 0)
                          FROM order_item oi JOIN product p ON oi.product_id = p.product_id
                          WHERE oi.order_id = co.order_id),
                         60
                     ) AS total_weight_num,
                     COALESCE(
-                        (SELECT ROUND(SUM(oi.quantity * p.unit_price), 2)
+                        (SELECT ROUND(SUM(oi.quantity * oi.unit_price_at_order), 2)
                          FROM order_item oi JOIN product p ON oi.product_id = p.product_id
                          WHERE oi.order_id = co.order_id),
                         3200.00
@@ -196,16 +168,8 @@ def list_customer_orders(request: Request, search: Optional[str] = None, status_
                     ) AS allocated_train_slot
                 FROM customer_order co
                 JOIN customer c ON co.customer_id = c.customer_id
-                LEFT JOIN delivery_route dr ON c.route_id = dr.route_id
+                LEFT JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
                 LEFT JOIN station_store ss ON dr.station_id = ss.station_id
-                LEFT JOIN (
-                    SELECT oi_sub.order_id, tt_sub.destination_station_id
-                    FROM order_item oi_sub
-                    JOIN rail_allocation ra_sub ON oi_sub.order_item_id = ra_sub.order_item_id
-                    JOIN train_trip tt_sub ON ra_sub.trip_id = tt_sub.trip_id
-                    LIMIT 1
-                ) alloc ON co.order_id = alloc.order_id
-                LEFT JOIN station_store dest_ss ON alloc.destination_station_id = dest_ss.station_id
                 WHERE {" AND ".join(where_clauses)}
                 ORDER BY co.order_id DESC
             """
@@ -295,9 +259,9 @@ def get_order_tracking(tracking_id: str):
                     """
                     SELECT 
                         co.order_id, co.customer_id, co.order_date, co.delivery_date, co.status AS raw_status,
-                        c.customer_name, c.phone, c.address_line, c.city AS customer_city,
-                        COALESCE(ss.city, c.city, 'Colombo') AS destination_city,
-                        COALESCE(ss.address, 'Colombo Fort Goods Shed') AS hub_address,
+                        co.recipient_name AS customer_name, co.recipient_phone AS phone, co.delivery_address AS address_line, c.city AS customer_city,
+                        ss.city AS destination_city,
+                        ss.address AS hub_address,
                         COALESCE(
                             (SELECT GROUP_CONCAT(CONCAT(p.product_name) SEPARATOR ', ')
                              FROM order_item oi JOIN product p ON oi.product_id = p.product_id
@@ -305,13 +269,13 @@ def get_order_tracking(tracking_id: str):
                             'Highland Tea & Spices'
                         ) AS cargo_name,
                         COALESCE(
-                            (SELECT ROUND(SUM(oi.quantity * p.space_consumption_rate * 50), 0)
+                            (SELECT ROUND(SUM(oi.quantity * p.unit_weight_kg), 0)
                              FROM order_item oi JOIN product p ON oi.product_id = p.product_id
                              WHERE oi.order_id = co.order_id),
                             60
                         ) AS total_weight_num,
                         COALESCE(
-                            (SELECT ROUND(SUM(oi.quantity * p.unit_price), 2)
+                            (SELECT ROUND(SUM(oi.quantity * oi.unit_price_at_order), 2)
                              FROM order_item oi JOIN product p ON oi.product_id = p.product_id
                              WHERE oi.order_id = co.order_id),
                             3200.00
@@ -326,7 +290,7 @@ def get_order_tracking(tracking_id: str):
                         ) AS allocated_train_slot
                     FROM customer_order co
                     JOIN customer c ON co.customer_id = c.customer_id
-                    LEFT JOIN delivery_route dr ON c.route_id = dr.route_id
+                    LEFT JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
                     LEFT JOIN station_store ss ON dr.station_id = ss.station_id
                     WHERE co.order_id = %s
                     """,
@@ -337,18 +301,7 @@ def get_order_tracking(tracking_id: str):
                 row = None
 
             if not row:
-                # Return standard fallback representation for valid tracking UI display
-                hub = HUB_CODE_MAP.get(tracking_id[-3:].upper(), HUB_CODE_MAP["CMB"])
-                dest_city = hub["city"]
-                hub_addr = hub["station"]
-                norm_status = "transit"
-                date_str = "2026-09-04"
-                cargo = "Ceylon Tea & Spices (Export Grade)"
-                weight = "120 kg"
-                recipient = "Consignment Recipient"
-                amount = 3250.0
-                train_slot = "06:30 AM Express Rail 101"
-                oid = order_id or 1001
+                raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND: Order does not exist.")
             else:
                 dest_city = row["destination_city"]
                 hub_addr = row["hub_address"]
@@ -425,16 +378,18 @@ def get_order_tracking(tracking_id: str):
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_consignment_order(payload: CreateOrderRequest, request: Request):
+def create_consignment_order(payload: CreateOrderRequest, request: Request,
+                             current_user: dict = Depends(require_roles(["CUSTOMER"]))):
     """
     Creates a new real customer consignment order in MySQL database with multi-item catalogue support,
     and alerts all active Logistics Managers via automated freight dispatch notification.
     """
-    token = get_token_from_request(request)
-    session_user = decode_access_token(token) if token else None
+    if current_user.get("force_password_reset"):
+        raise HTTPException(status_code=403, detail={"error_code": "PASSWORD_RESET_REQUIRED", "message": "Complete your password reset before checkout."})
+    session_user = {"sub": current_user["user_id"], "role": current_user["role"]}
 
     # Determine destination hub
-    hub_key = payload.destination_hub.upper()
+    hub_key = payload.destination_hub.strip().upper()
     hub_info = HUB_CODE_MAP.get(hub_key)
     if not hub_info:
         # Match by name
@@ -444,31 +399,29 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 hub_key = k
                 break
     if not hub_info:
-        hub_info = HUB_CODE_MAP["CMB"]
-        hub_key = "CMB"
+        raise HTTPException(status_code=422, detail={"error_code": "INVALID_DESTINATION_HUB", "message": "Select a valid destination hub."})
 
     with get_db() as conn:
         with conn.cursor() as cursor:
-            # 1. Resolve Customer ID
-            customer_id = None
-            if session_user and session_user.get("role") == "CUSTOMER":
-                cursor.execute("SELECT customer_id FROM customer WHERE user_id = %s", (session_user["sub"],))
-                res = cursor.fetchone()
-                if res:
-                    customer_id = res["customer_id"]
-
-            if not customer_id:
-                # Use default active seed customer
-                cursor.execute("SELECT customer_id FROM customer ORDER BY customer_id ASC LIMIT 1")
-                res = cursor.fetchone()
-                customer_id = res["customer_id"] if res else 1
-
-            # Fetch customer details for notification
-            cursor.execute("SELECT customer_name, phone, address_line, city FROM customer WHERE customer_id = %s", (customer_id,))
-            cust_row = cursor.fetchone() or {}
-            customer_display_name = payload.recipient_name or cust_row.get("customer_name") or "Lanka Freight Client"
-            customer_phone = payload.recipient_phone or cust_row.get("phone") or "0770000000"
-            delivery_addr = payload.delivery_address or cust_row.get("address_line") or hub_info["station"]
+            cursor.execute("""
+                SELECT c.customer_id, c.customer_name, c.phone, c.address_line,
+                       c.route_id, ss.city AS station_city
+                FROM customer c
+                JOIN delivery_route dr ON dr.route_id=c.route_id
+                JOIN station_store ss ON ss.station_id=dr.station_id
+                WHERE c.user_id=%s AND ss.is_active=1
+            """, (current_user["user_id"],))
+            cust_row = cursor.fetchone()
+            if not cust_row:
+                raise HTTPException(status_code=422, detail={"error_code": "CUSTOMER_ROUTE_REQUIRED", "message": "Your customer profile needs a delivery route before checkout."})
+            if cust_row["station_city"].casefold() != hub_info["city"].casefold():
+                raise HTTPException(status_code=422, detail={"error_code": "ORDER_ROUTE_MISMATCH", "message": "Select the hub matching your saved customer route."})
+            customer_id = cust_row["customer_id"]
+            customer_display_name = (payload.recipient_name if payload.recipient_name is not None else cust_row["customer_name"]).strip()
+            customer_phone = (payload.recipient_phone if payload.recipient_phone is not None else cust_row["phone"]).strip()
+            delivery_addr = (payload.delivery_address if payload.delivery_address is not None else cust_row["address_line"]).strip()
+            if not all((customer_display_name, customer_phone, delivery_addr)):
+                raise HTTPException(status_code=422, detail={"error_code": "ORDER_DESTINATION_REQUIRED", "message": "Provide a recipient name, phone and delivery address."})
 
             # 2. Dates
             order_date = datetime.date.today()
@@ -483,10 +436,10 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
             # 3. Insert customer_order
             cursor.execute(
                 """
-                INSERT INTO customer_order (customer_id, order_date, delivery_date, status)
-                VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING')
+                INSERT INTO customer_order (customer_id, order_date, delivery_date, status, delivery_route_id, delivery_address, recipient_name, recipient_phone)
+                VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING', %s, %s, %s, %s)
                 """,
-                (customer_id, order_date, delivery_date)
+                (customer_id, order_date, delivery_date, cust_row["route_id"], delivery_addr, customer_display_name, customer_phone)
             )
             order_id = cursor.lastrowid
             tracking_code = f"KP-{order_id:05d}-{hub_key}"

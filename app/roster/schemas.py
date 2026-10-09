@@ -71,6 +71,8 @@ class Truck(FrozenModel):
     station_id: str | None = Field(min_length=1)
     plate_number: str
     is_active: bool
+    capacity: str | None = None
+    capacity_unit: Literal["KG"] | None = None
 
 
 class Staff(FrozenModel):
@@ -144,6 +146,7 @@ class AssignmentCreatedResponse(FrozenModel):
 
 class StaffHours(FrozenModel):
     staff_id: PositiveInt
+    staff_name: str | None = None
     staff_type: Literal["DRIVER", "ASSISTANT"]
     scheduled_seconds: int = Field(ge=0)
     limit_seconds: PositiveInt
@@ -163,6 +166,12 @@ class AuditAttempt(FrozenModel):
     audit_id: PositiveInt
     actor_id: PositiveInt
     actor_name: str | None
+    route_name: str | None = None
+    station_id: int | None = None
+    station_name: str | None = None
+    plate_number: str | None = None
+    driver_name: str | None = None
+    assistant_name: str | None = None
     attempted_route_id: PositiveInt
     attempted_truck_id: PositiveInt
     attempted_driver_id: PositiveInt
@@ -182,3 +191,103 @@ class AuditAttempt(FrozenModel):
 class AuditResponse(FrozenModel):
     attempts: tuple[AuditAttempt, ...]
     meta: MySQLWriteMeta = MySQLWriteMeta()
+
+
+class CargoSelection(FrozenModel):
+    order_ids: tuple[PositiveInt, ...] = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def unique_orders(self):
+        if len(set(self.order_ids)) != len(self.order_ids):
+            raise ValueError("Select each whole order only once.")
+        return self
+
+
+class StationStore(FrozenModel):
+    station_id: PositiveInt
+    station_name: str
+    address: str
+
+
+class StoresResponse(FrozenModel):
+    stores: tuple[StationStore, ...]
+    timezone: Literal["Asia/Colombo"] = "Asia/Colombo"
+
+
+class CargoItem(FrozenModel):
+    order_id: PositiveInt
+    order_item_id: PositiveInt
+    product_id: PositiveInt
+    product_name: str
+    ordered_quantity: int
+    allocated_quantity: int
+    received_quantity: int
+    wrong_destination: int
+    unit_weight_kg: str | None
+
+
+class CargoOrder(FrozenModel):
+    order_id: PositiveInt
+    delivery_date: date
+    order_status: str
+    route_id: PositiveInt
+    station_id: PositiveInt
+    station_name: str
+    route_name: str
+    delivery_address: str
+    recipient_name: str
+    recipient_phone: str
+    customer_name: str
+    assigned_roster_id: int | None
+    delivery_id: int | None
+    assigned_weight_kg: str | None
+    weight_kg: str
+    eligible: bool
+    blocked_reasons: tuple[str, ...]
+    items: tuple[CargoItem, ...]
+
+
+class DemandResponse(FrozenModel):
+    orders: tuple[CargoOrder, ...]
+    timezone: Literal["Asia/Colombo"] = "Asia/Colombo"
+
+
+class TruckSchedule(FrozenModel):
+    roster_id: PositiveInt
+    route_id: PositiveInt
+    station_id: PositiveInt
+    station_name: str
+    route_name: str
+    truck_id: PositiveInt
+    plate_number: str
+    capacity: str
+    capacity_unit: Literal["KG"] | None
+    is_active: bool
+    driver_id: PositiveInt
+    driver_name: str
+    assistant_id: PositiveInt
+    assistant_name: str
+    start_time: AwareDatetime
+    end_time: AwareDatetime
+    status: str
+    order_count: int
+    unit_count: int
+    cargo_weight_kg: str
+
+
+class SchedulesResponse(FrozenModel):
+    schedules: tuple[TruckSchedule, ...]
+    timezone: Literal["Asia/Colombo"] = "Asia/Colombo"
+
+
+class LoadingListResponse(DemandResponse):
+    schedule: TruckSchedule
+
+
+class CargoAssignedResponse(FrozenModel):
+    status: Literal["SUCCESS"] = "SUCCESS"
+    result_code: Literal["ORDERS_ASSIGNED", "ORDERS_ALREADY_ASSIGNED"]
+    roster_id: PositiveInt
+    order_ids: tuple[PositiveInt, ...]
+    cargo_weight_kg: str
+    timezone: Literal["Asia/Colombo"] = "Asia/Colombo"

@@ -109,8 +109,9 @@ class HoursApiTests(unittest.TestCase):
 
 
 class DutyCursor:
-    def __init__(self, duties=(), *, fail=False):
+    def __init__(self, duties=(), *, staff=(), fail=False):
         self.duties = tuple(duties)
+        self.staff = tuple(staff)
         self.fail = fail
         self.executions = []
         self.current = []
@@ -124,6 +125,8 @@ class DutyCursor:
 
     def execute(self, statement, parameters=None):
         self.executions.append((statement, parameters))
+        if statement == mysql.STAFF_SQL:
+            self.current = self.staff
         if statement == mysql.HOURS_SQL:
             if self.fail:
                 raise pymysql.OperationalError(1146, "forced missing reporting view")
@@ -191,8 +194,8 @@ def duty(staff_id, duty_type, start, end, status="SCHEDULED"):
 
 
 class MySQLHoursTests(unittest.TestCase):
-    def run_hours(self, week_start, duties=(), *, fail=False):
-        cursor = DutyCursor(duties, fail=fail)
+    def run_hours(self, week_start, duties=(), *, staff=(), fail=False):
+        cursor = DutyCursor(duties, staff=staff, fail=fail)
         connection = DutyConnection(cursor)
         with patch.object(mysql, "get_db", return_value=DutyDatabase(connection)):
             result = mysql.MySQLRosterAdapter().hours(week_start)
@@ -205,6 +208,22 @@ class MySQLHoursTests(unittest.TestCase):
         self.assertEqual(connection.rollbacks, 1)
         self.assertTrue(cursor.closed)
         self.assertTrue(connection.closed)
+
+    def test_eligible_staff_without_duties_have_zero_hours_in_both_weeks(self):
+        staff = (
+            {"staff_id": 31, "name": "Driver", "staff_type": "DRIVER"},
+            {"staff_id": 32, "name": "Assistant", "staff_type": "ASSISTANT"},
+        )
+        monday = datetime(2026, 9, 14)
+        duties = (duty(31, "DRIVER", monday, monday + timedelta(hours=2)),)
+        populated, cursor, _ = self.run_hours(date(2026, 9, 14), duties, staff=staff)
+        self.assertEqual([row.scheduled_seconds for row in populated.hours], [7200, 0])
+        self.assertEqual([row.staff_name for row in populated.hours], ["Driver", "Assistant"])
+        empty_week, _, _ = self.run_hours(date(2026, 9, 21), duties, staff=staff)
+        self.assertEqual([row.scheduled_seconds for row in empty_week.hours], [0, 0])
+        self.assertEqual([row.remaining_seconds for row in empty_week.hours], [144000, 216000])
+        self.assertIn((mysql.STAFF_SQL, (1, "DRIVER", "ASSISTANT")), cursor.executions)
+        self.assertNotIn("work_hours", mysql.HOURS_SQL + mysql.STAFF_SQL)
 
     def test_exact_caps_one_second_over_and_staff_in_both_duty_roles(self):
         monday = datetime(2026, 9, 14)

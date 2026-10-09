@@ -1,8 +1,5 @@
 """Explicit MySQL roster reads and one atomic assignment operation.
-
-Uses the existing connection manager without altering authentication sessions.
-No seed, legacy stored-procedure call, or development fallback exists here.
-Asia/Colombo requires system IANA timezone data (or tzdata on Windows).
+Asia/Colombo requires system IANA timezone data .
 """
 
 from contextlib import contextmanager
@@ -33,7 +30,7 @@ ROUTES_SQL = """
     FROM delivery_route ORDER BY route_id
 """
 TRUCKS_SQL = """
-    SELECT truck_id, plate_number, is_active
+    SELECT truck_id, plate_number, is_active, capacity, capacity_unit
     FROM truck WHERE is_active = %s ORDER BY truck_id
 """
 STAFF_SQL = """
@@ -71,10 +68,19 @@ AUDIT_SQL = """
            ra.roster_id AS linked_roster_id, ra.dispatcher_id AS assignment_dispatcher_id,
            ra.route_id AS attempted_route_id, ra.truck_id AS attempted_truck_id,
            ra.driver_id AS attempted_driver_id, ra.assistant_id AS attempted_assistant_id,
+           route.route_name, route.station_id, station.city AS station_name,
+           truck.plate_number, driver.name AS driver_name, assistant.name AS assistant_name,
            ra.start_time AS attempted_start_time, ra.end_time AS attempted_end_time
     FROM audit_log AS audit
     LEFT JOIN roster_assignment AS ra ON ra.roster_id = audit.roster_id
     LEFT JOIN `user` AS actor ON actor.user_id = audit.user_id
+    LEFT JOIN delivery_route AS route ON route.route_id = ra.route_id
+    LEFT JOIN station_store AS station ON station.station_id = route.station_id
+    LEFT JOIN truck AS truck ON truck.truck_id = ra.truck_id
+    LEFT JOIN delivery_staff AS driver_staff ON driver_staff.delivery_staff_id = ra.driver_id
+    LEFT JOIN `user` AS driver ON driver.user_id = driver_staff.user_id
+    LEFT JOIN delivery_staff AS assistant_staff ON assistant_staff.delivery_staff_id = ra.assistant_id
+    LEFT JOIN `user` AS assistant ON assistant.user_id = assistant_staff.user_id
     WHERE audit.action = %s AND audit.outcome = 'ACCEPTED'
       AND audit.roster_id IS NOT NULL
     ORDER BY audit.occurred_at DESC, audit.audit_id DESC
@@ -99,7 +105,7 @@ LOCK_ROUTE_SQL = """
     FROM delivery_route WHERE route_id = %s FOR UPDATE
 """
 LOCK_TRUCK_SQL = """
-    SELECT truck_id, plate_number, is_active
+    SELECT truck_id, plate_number, is_active, capacity, capacity_unit
     FROM truck WHERE truck_id = %s FOR UPDATE
 """
 LOCK_CANDIDATE_STAFF_SQL = """
@@ -275,6 +281,12 @@ def _audit_attempt(row: dict, zone: ZoneInfo) -> AuditAttempt:
         audit_id=_positive_integer(row["audit_id"]),
         actor_id=actor_id,
         actor_name=_optional_text(row["actor_name"]),
+        route_name=_optional_text(row.get("route_name")),
+        station_id=_positive_integer(row["station_id"]) if row.get("station_id") is not None else None,
+        station_name=_optional_text(row.get("station_name")),
+        plate_number=_optional_text(row.get("plate_number")),
+        driver_name=_optional_text(row.get("driver_name")),
+        assistant_name=_optional_text(row.get("assistant_name")),
         attempted_route_id=_positive_integer(row["attempted_route_id"]),
         attempted_truck_id=_positive_integer(row["attempted_truck_id"]),
         attempted_driver_id=_positive_integer(row["attempted_driver_id"]),
@@ -328,6 +340,7 @@ class MySQLRosterAdapter:
                 trucks.append(Truck(
                     truck_id=_positive_integer(row["truck_id"]), station_id=None,
                     plate_number=_text(row["plate_number"]), is_active=True,
+                    capacity=format(Decimal(row["capacity"]), ".2f"), capacity_unit=row["capacity_unit"],
                 ))
             cursor.execute(STAFF_SQL, (1, "DRIVER", "ASSISTANT"))
             staff = tuple(Staff(
@@ -393,6 +406,23 @@ class MySQLRosterAdapter:
                     limit_seconds=limit,
                     remaining_seconds=limit - scheduled,
                 ))
+            cursor.execute(STAFF_SQL, (1, "DRIVER", "ASSISTANT"))
+            staff = cursor.fetchall()
+            names = {_positive_integer(row["staff_id"]): _text(row["name"]) for row in staff}
+            counted = {(row.staff_id, row.staff_type) for row in hours}
+            for row in staff:
+                staff_id = _positive_integer(row["staff_id"])
+                staff_type = row["staff_type"]
+                if staff_type not in ("DRIVER", "ASSISTANT"):
+                    raise _invalid()
+                if (staff_id, staff_type) not in counted:
+                    limit = 144000 if staff_type == "DRIVER" else 216000
+                    hours.append(StaffHours(
+                        staff_id=staff_id, staff_type=staff_type, scheduled_seconds=0,
+                        limit_seconds=limit, remaining_seconds=limit,
+                    ))
+            hours = [row.model_copy(update={"staff_name": names.get(row.staff_id)}) for row in hours]
+            hours.sort(key=lambda row: (row.staff_id, row.staff_type))
             return HoursResponse(
                 week_start=week_start, week_end=week_end, hours=tuple(hours), meta=MySQLWriteMeta(),
             )

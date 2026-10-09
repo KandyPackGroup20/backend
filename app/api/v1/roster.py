@@ -2,6 +2,8 @@
 
 import logging
 import re
+import os
+import pymysql
 from datetime import date, datetime, timedelta
 from typing import Annotated
 from uuid import uuid4
@@ -26,6 +28,9 @@ from app.roster.schemas import (
     AssignmentCreatedResponse, AssignmentRequest, AssignmentsResponse, AuditResponse,
     CandidatesResponse, HoursResponse, parse_instant,
 )
+from app.roster.schemas import (CargoSelection, CargoAssignedResponse, StoresResponse,
+                                DemandResponse, SchedulesResponse, LoadingListResponse)
+from app.roster.cargo import CargoRepository, CargoError
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,27 @@ class RosterRoute(APIRoute):
 router = APIRouter(
     prefix="/roster", tags=["Fleet Roster & Driver Assignment"], route_class=RosterRoute
 )
+
+
+def get_cargo_repository() -> CargoRepository:
+    if os.environ.get("ROSTER_DATA_MODE") != "mysql":
+        raise HTTPException(status_code=503, detail={"error_code": "TRUCK_SCHEDULING_UNAVAILABLE",
+                            "message": "Planned cargo requires the roster MySQL database."})
+    return CargoRepository()
+
+
+def cargo_operation(operation):
+    try:
+        return operation()
+    except CargoError as exc:
+        raise HTTPException(status_code=exc.status, detail={"error_code": exc.code, "message": exc.message}) from exc
+    except Exception as exc:
+        retryable = isinstance(exc, pymysql.OperationalError) and exc.args[0] in (1205, 1213, 2006, 2013)
+        logger.exception("Planned cargo operation failed")
+        raise HTTPException(status_code=503, detail={
+            "error_code": "TRANSACTION_RETRY_REQUIRED" if retryable else "TRUCK_SCHEDULING_UNAVAILABLE",
+            "message": "Read the loading list and retry the same selection." if retryable else "Planned cargo is unavailable. Check the fresh schema and retry.",
+        }) from exc
 
 
 def assignment_window(
@@ -229,3 +255,34 @@ def assign_roster(
             status_code=503,
             detail={"error_code": "ROSTER_ASSIGNMENT_FAILED", "message": "Roster assignment could not be stored."},
         ) from exc
+
+
+@router.get("/stores", response_model=StoresResponse)
+def cargo_stores(user: dict = Depends(require_roster_reader), repository=Depends(get_cargo_repository)):
+    return cargo_operation(repository.stores)
+
+
+@router.get("/demand", response_model=DemandResponse)
+def cargo_demand(station_id: Annotated[int, Query(gt=0)], from_date: date, to_date: date,
+                 user: dict = Depends(require_roster_reader), repository=Depends(get_cargo_repository)):
+    if from_date.year < 1000 or to_date < from_date or (to_date-from_date).days > 366:
+        raise HTTPException(status_code=422, detail={"error_code": "INVALID_DEMAND_WINDOW", "message": "Choose an ordered date range of at most 366 days."})
+    return cargo_operation(lambda: repository.demand(station_id, from_date, to_date))
+
+
+@router.get("/schedules", response_model=SchedulesResponse)
+def cargo_schedules(station_id: Annotated[int, Query(gt=0)],
+                    window: tuple[datetime, datetime] = Depends(assignment_window),
+                    user: dict = Depends(require_roster_reader), repository=Depends(get_cargo_repository)):
+    return cargo_operation(lambda: repository.schedules(station_id, *window))
+
+
+@router.get("/schedules/{roster_id}/loading-list", response_model=LoadingListResponse)
+def cargo_loading_list(roster_id: int, user: dict = Depends(require_roster_reader), repository=Depends(get_cargo_repository)):
+    return cargo_operation(lambda: repository.loading_list(roster_id))
+
+
+@router.put("/schedules/{roster_id}/orders", response_model=CargoAssignedResponse)
+def assign_whole_orders(roster_id: int, request: CargoSelection,
+                        user: dict = Depends(require_roster_writer), repository=Depends(get_cargo_repository)):
+    return cargo_operation(lambda: repository.assign(roster_id, request.order_ids, user["user_id"]))

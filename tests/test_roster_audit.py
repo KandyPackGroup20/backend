@@ -221,6 +221,23 @@ class MySQLAuditTests(unittest.TestCase):
         self.assertIn("audit.roster_id IS NOT NULL", mysql.AUDIT_SQL)
         self.assertIn("LEFT JOIN roster_assignment", mysql.AUDIT_SQL)
 
+    def test_history_resolves_labels_without_excluding_inactive_accounts(self):
+        row = audit_row(3, datetime(2026, 9, 20, 10)) | {
+            "route_name": "Colombo North", "station_id": 17, "station_name": "Colombo",
+            "plate_number": "WP-CAB-1001", "driver_name": "Former Driver",
+            "assistant_name": "Former Assistant", "actor_name": "Former Dispatcher",
+        }
+        response, cursor, _ = self.run_audit((row,))
+        result = response.attempts[0]
+        self.assertEqual((result.route_name, result.station_name, result.plate_number),
+                         ("Colombo North", "Colombo", "WP-CAB-1001"))
+        self.assertEqual((result.driver_name, result.assistant_name, result.actor_name),
+                         ("Former Driver", "Former Assistant", "Former Dispatcher"))
+        self.assertNotIn("is_active", mysql.AUDIT_SQL)
+        self.assertEqual(sum(sql == mysql.AUDIT_SQL for sql, _ in cursor.executions), 1)
+        fallback, _, _ = self.run_audit((audit_row(3, datetime(2026, 9, 20, 10)),))
+        self.assertIsNone(fallback.attempts[0].driver_name)
+
     def test_inconsistent_persisted_detail_is_an_explicit_data_error(self):
         row = audit_row(1, datetime(2026, 9, 20, 8), outcome="ACCEPTED")
         row["outcome"] = "REJECTED"

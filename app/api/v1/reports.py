@@ -42,7 +42,7 @@ def get_rail_analytics():
             SUM(ra.allocated_space) AS total_cubic_meters_shipped
         FROM customer_order co
         JOIN customer c ON co.customer_id = c.customer_id
-        LEFT JOIN delivery_route dr ON c.route_id = dr.route_id
+        LEFT JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
         LEFT JOIN station_store ss ON dr.station_id = ss.station_id
         JOIN order_item oi ON co.order_id = oi.order_id
         JOIN rail_allocation ra ON oi.order_item_id = ra.order_item_id
@@ -115,7 +115,7 @@ def get_quarterly_sales():
         JOIN customer c
             ON co.customer_id = c.customer_id
         LEFT JOIN delivery_route dr
-            ON c.route_id = dr.route_id
+            ON co.delivery_route_id = dr.route_id
         JOIN order_item oi
             ON co.order_id = oi.order_id
         JOIN product p
@@ -146,7 +146,7 @@ def get_quarterly_sales():
         JOIN customer c
             ON co.customer_id = c.customer_id
         LEFT JOIN delivery_route dr
-            ON c.route_id = dr.route_id
+            ON co.delivery_route_id = dr.route_id
         JOIN order_item oi
             ON co.order_id = oi.order_id
         JOIN product p
@@ -285,7 +285,7 @@ def get_city_route_sales():
         JOIN customer c
             ON co.customer_id = c.customer_id
         JOIN delivery_route dr
-            ON c.route_id = dr.route_id
+            ON co.delivery_route_id = dr.route_id
         JOIN station_store ss
             ON dr.station_id = ss.station_id
         JOIN order_item oi
@@ -310,7 +310,7 @@ def get_city_route_sales():
         JOIN customer c
             ON co.customer_id = c.customer_id
         JOIN delivery_route dr
-            ON c.route_id = dr.route_id
+            ON co.delivery_route_id = dr.route_id
         JOIN station_store ss
             ON dr.station_id = ss.station_id
         JOIN order_item oi

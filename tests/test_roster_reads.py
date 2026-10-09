@@ -304,7 +304,7 @@ class RosterReadsTests(unittest.TestCase):
     def test_mysql_adapter_maps_verified_catalog_rows_and_closes_read_snapshot(self):
         cursor = _RosterCursor([
             [{"route_id": 1, "station_id": 17, "route_name": "Colombo", "max_duration_seconds": 90061}],
-            [{"truck_id": 1, "plate_number": "WP-CA-1234", "is_active": 1}],
+            [{"truck_id": 1, "plate_number": "WP-CA-1234", "is_active": 1, "capacity": "3500.00", "capacity_unit": None}],
             [
                 {"staff_id": 2, "person_id": 20, "name": "Driver", "staff_type": "DRIVER"},
                 {"staff_id": 3, "person_id": 21, "name": "Assistant", "staff_type": "ASSISTANT"},

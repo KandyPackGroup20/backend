@@ -150,8 +150,9 @@ def login(payload: LoginRequest, response: Response):
                     secure=False,
                     max_age=3600 * 24 # 24 Hours
                 )
-                
                 return {
+                    "access_token": access_token,
+                    "token_type": "bearer",
                     "user_id": user['user_id'],
                     "email": user['email'],
                     "full_name": user['name'],
@@ -176,6 +177,7 @@ def login(payload: LoginRequest, response: Response):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"LOGIN_FAILED: {str(err)}"
         )
+
 
     
 # 2. Customer Registration Endpoint (Atomic Transaction & Parameterized)

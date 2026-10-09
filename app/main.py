@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api.v1 import auth, rail, roster, reports, notifications, orders
+from app.api.v1 import auth, rail, roster, reports, notifications, orders, inventory
 from app.core.notifications import ensure_notification_table
 from app.core.migrations import run_migrations
 
@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[STARTUP DB INIT WARNING] Failed to ensure tables on startup: {e}")
     yield
+
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -42,6 +43,8 @@ app.include_router(rail.router, prefix=settings.API_V1_STR)
 app.include_router(roster.router, prefix=settings.API_V1_STR)
 app.include_router(reports.router, prefix=settings.API_V1_STR)
 app.include_router(notifications.router, prefix=settings.API_V1_STR)
+app.include_router(inventory.router, prefix=settings.API_V1_STR)
+
 
 @app.get("/")
 def root():

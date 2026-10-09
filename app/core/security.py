@@ -47,14 +47,14 @@ def decode_access_token(token: str) -> Optional[dict]:
         return None
 
 def get_token_from_request(request: Request) -> Optional[str]:
-    """Extract token from HttpOnly cookie or Authorization Bearer header."""
-    cookie_token = request.cookies.get("kandypack_session")
-    if cookie_token:
-        return cookie_token
-    
+    """Extract token from Authorization Bearer header first, then fallback to HttpOnly cookie."""
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         return auth_header.split(" ")[1]
+
+    cookie_token = request.cookies.get("kandypack_session")
+    if cookie_token:
+        return cookie_token
     
     return None
 

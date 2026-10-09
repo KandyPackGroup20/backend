@@ -499,13 +499,23 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 for item in payload.items:
                     prod = prod_map.get(item.product_id)
                     if prod:
-                        cursor.execute(
-                            """
-                            INSERT INTO order_item (order_id, product_id, quantity)
-                            VALUES (%s, %s, %s)
-                            """,
-                            (order_id, item.product_id, item.quantity)
-                        )
+                        unit_p = float(prod.get("unit_price", 0.0))
+                        try:
+                            cursor.execute(
+                                """
+                                INSERT INTO order_item (order_id, product_id, quantity, unit_price_at_order)
+                                VALUES (%s, %s, %s, %s)
+                                """,
+                                (order_id, item.product_id, item.quantity, unit_p)
+                            )
+                        except Exception:
+                            cursor.execute(
+                                """
+                                INSERT INTO order_item (order_id, product_id, quantity)
+                                VALUES (%s, %s, %s)
+                                """,
+                                (order_id, item.product_id, item.quantity)
+                            )
                         item_weight = float(prod["unit_weight_kg"]) * item.quantity
                         item_space = float(prod["space_consumption_rate"]) * item.quantity
                         item_price = float(prod["unit_price"]) * item.quantity
@@ -520,13 +530,23 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request):
                 prod = cursor.fetchone()
                 product_id = prod["product_id"] if prod else 1
                 qty = max(1, int((payload.weight_kg or 25) / 2))
-                cursor.execute(
-                    """
-                    INSERT INTO order_item (order_id, product_id, quantity)
-                    VALUES (%s, %s, %s)
-                    """,
-                    (order_id, product_id, qty)
-                )
+                unit_p = float(prod["unit_price"]) if prod else 3200.0
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO order_item (order_id, product_id, quantity, unit_price_at_order)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (order_id, product_id, qty, unit_p)
+                    )
+                except Exception:
+                    cursor.execute(
+                        """
+                        INSERT INTO order_item (order_id, product_id, quantity)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (order_id, product_id, qty)
+                    )
                 total_weight_kg = float(payload.weight_kg or 25.0)
                 total_space_units = float(prod["space_consumption_rate"]) * qty if prod else 0.5
                 total_goods_amount = float(prod["unit_price"]) * qty if prod else 3200.0

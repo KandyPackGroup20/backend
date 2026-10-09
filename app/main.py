@@ -1,12 +1,30 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.v1 import auth, rail, roster, reports, notifications, orders, inventory
+from app.core.notifications import ensure_notification_table
+from app.core.migrations import run_migrations
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure all tables and columns exist upon startup (Render cloud DB / local)
+    try:
+        run_migrations()
+    except Exception as e:
+        print(f"[STARTUP DB MIGRATION WARNING] Failed to run migrations on startup: {e}")
+    try:
+        ensure_notification_table()
+    except Exception as e:
+        print(f"[STARTUP DB INIT WARNING] Failed to ensure tables on startup: {e}")
+    yield
+
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan
 )
 
 # CORS setup for dual frontends (Customer & Admin)

@@ -1,7 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from app.core.database import get_db
+from app.core.security import require_roles
 
-router = APIRouter(prefix="/reports", tags=["Management Reports & Analytics"])
+REPORT_ROLES = ["SUPERADMIN"]
+
+router = APIRouter(
+    prefix="/reports",
+    tags=["Management Reports & Analytics"],
+    dependencies=[Depends(require_roles(REPORT_ROLES))],
+)
 
 @router.get("/analytics")
 def get_rail_analytics():

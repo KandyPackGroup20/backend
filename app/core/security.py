@@ -1,22 +1,20 @@
-import warnings
 import jwt
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import Request, HTTPException, status, Depends
 from app.core.config import settings
-
-# Suppress PyJWT InsecureKeyLengthWarning for HMAC keys < 32 bytes (e.g. from cloud env vars)
-warnings.filterwarnings("ignore", message=".*HMAC key is.*below the minimum recommended length.*")
+from app.core.database import get_db
+from urllib.parse import urlsplit
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify plain password against bcrypt hash, with plaintext fallback for demo seeds."""
+    """Verify bcrypt only; demo plaintext and universal passwords are never accepted."""
     if not hashed_password:
         return False
-    if plain_password == hashed_password:
-        return True
     try:
-        pw_bytes = plain_password[:72].encode("utf-8")
+        pw_bytes = plain_password.encode("utf-8")
+        if len(pw_bytes) > 72:
+            return False
         hash_bytes = hashed_password.encode("utf-8")
         return bcrypt.checkpw(pw_bytes, hash_bytes)
     except Exception:
@@ -24,7 +22,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def get_password_hash(password: str) -> str:
     """Hash password using direct bcrypt library (bypassing passlib 72-byte init bug)."""
-    pw_bytes = password[:72].encode("utf-8")
+    pw_bytes = password.encode("utf-8")
+    if len(pw_bytes) > 72:
+        raise HTTPException(status_code=422, detail="Password must be at most 72 UTF-8 bytes.")
     salt = bcrypt.gensalt(rounds=12)
     return bcrypt.hashpw(pw_bytes, salt).decode("utf-8")
 
@@ -41,7 +41,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def decode_access_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM], options={"require": ["exp", "sub"]})
         return payload
     except jwt.PyJWTError:
         return None
@@ -74,13 +74,35 @@ def get_current_user(request: Request) -> dict:
             detail="INVALID_TOKEN: Session token is invalid or has expired."
         )
     
-    return {
-        "user_id": int(payload["sub"]),
-        "email": payload.get("email"),
-        "name": payload.get("name", ""),
-        "role": payload.get("role"),
-        "force_password_reset": payload.get("force_password_reset", False)
-    }
+    try:
+        user_id = int(payload["sub"])
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT user_id, email, name, role, force_password_reset FROM user WHERE user_id = %s AND is_active = 1", (user_id,))
+            user = cursor.fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="ACCOUNT_INACTIVE")
+    if request_portal(request) == "admin" and user["role"] == "CUSTOMER":
+        raise HTTPException(status_code=403, detail="CUSTOMER_ACCESS_DENIED")
+    if user["force_password_reset"] and request.url.path not in {
+        f"{settings.API_V1_STR}/auth/me", f"{settings.API_V1_STR}/auth/change-password", f"{settings.API_V1_STR}/auth/logout"
+    }:
+        raise HTTPException(status_code=403, detail="PASSWORD_RESET_REQUIRED")
+    return user
+
+
+def request_portal(request: Request) -> str:
+    """Use an allowlisted browser origin, never a client-supplied role/portal claim."""
+    origin = request.headers.get("origin")
+    if origin:
+        if origin not in settings.AUTH_ALLOWED_ORIGINS:
+            raise HTTPException(status_code=403, detail="ORIGIN_NOT_ALLOWED")
+        hostname = urlsplit(origin).hostname or ""
+    else:
+        hostname = request.url.hostname or ""
+    return "admin" if hostname.lower().startswith("admin.") else "customer"
 
 def require_roles(allowed_roles: List[str]):
     """FastAPI RBAC dependency factory to enforce role-based access control."""

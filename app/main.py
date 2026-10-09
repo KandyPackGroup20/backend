@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.v1 import auth, rail, roster, reports, notifications, orders, inventory
@@ -32,11 +33,22 @@ app = FastAPI(
 # CORS setup for dual frontends (Customer & Admin)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.AUTH_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def check_browser_origin(request: Request, call_next):
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin and origin not in settings.AUTH_ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"detail": "ORIGIN_NOT_ALLOWED"})
+        if request.cookies.get("kandypack_session") and not origin and request.headers.get("sec-fetch-site") == "cross-site":
+            return JSONResponse(status_code=403, content={"detail": "ORIGIN_NOT_ALLOWED"})
+    return await call_next(request)
+
 
 # Include API v1 Routers
 app.include_router(auth.router, prefix=settings.API_V1_STR)

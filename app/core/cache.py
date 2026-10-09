@@ -150,70 +150,44 @@ def invalidate_cache(key_prefix: str) -> int:
 
 # rate limiting
 
+from threading import RLock
+_login_lock = RLock()
+_login_attempt_locks = tuple(RLock() for _ in range(256))
+
+
+def login_attempt_lock(identifier: str):
+    """Bounded lock stripes serialize check/verify/record for concurrent same-account logins."""
+    return _login_attempt_locks[hash(identifier.strip().casefold()) % len(_login_attempt_locks)]
+
 def check_rate_limit(identifier: str, max_attempts: int = 5, window_seconds: int = 60) -> Tuple[bool, int]:
-    key = f"ratelimit:login:{identifier}"
-    client = get_redis_client()
-
-    if client:
-        try:
-            attempts_raw = client.get(key)
-            attempts = int(attempts_raw) if attempts_raw else 0
-            if attempts >= max_attempts:
-                return False, 0
-            return True, max_attempts - attempts
-        except Exception:
-            pass
-
-    now = time.time()
-    record = _memory_rate_limit.get(key)
-    if record:
-        if now < record["expires_at"]:
-            attempts = record["attempts"]
-            if attempts >= max_attempts:
-                return False, 0
-            return True, max_attempts - attempts
-        else:
-            _memory_rate_limit.pop(key, None)
-
-    return True, max_attempts
-
+    now = time.monotonic()
+    with _login_lock:
+        key = identifier.strip().casefold()
+        # Prune expired entries to keep the process-local fallback bounded by recent activity.
+        for old_key, old in list(_memory_rate_limit.items()):
+            if old["locked_until"] <= now and not any(t > now - window_seconds for t in old["failures"]):
+                _memory_rate_limit.pop(old_key, None)
+        record = _memory_rate_limit.get(key)
+        if not record:
+            return True, max_attempts
+        if record["locked_until"] > now:
+            return False, 0
+        record["failures"] = [t for t in record["failures"] if t > now - window_seconds]
+        return True, max(0, max_attempts - len(record["failures"]))
 
 def record_login_failure(identifier: str, window_seconds: int = 60) -> int:
-    key = f"ratelimit:login:{identifier}"
-    client = get_redis_client()
-
-    if client:
-        try:
-            pipe = client.pipeline()
-            pipe.incr(key)
-            pipe.expire(key, window_seconds)
-            results = pipe.execute()
-            return int(results[0])
-        except Exception:
-            pass
-
-    now = time.time()
-    record = _memory_rate_limit.get(key)
-    if record and now < record["expires_at"]:
-        record["attempts"] += 1
-        return record["attempts"]
-    else:
-        _memory_rate_limit[key] = {
-            "attempts": 1,
-            "expires_at": now + window_seconds
-        }
-        return 1
-
+    now = time.monotonic()
+    with _login_lock:
+        record = _memory_rate_limit.setdefault(identifier.strip().casefold(), {"failures": [], "locked_until": 0})
+        record["failures"] = [t for t in record["failures"] if t > now - window_seconds]
+        record["failures"].append(now)
+        if len(record["failures"]) >= 5:
+            record["locked_until"] = now + 15 * 60
+        return len(record["failures"])
 
 def reset_login_failures(identifier: str) -> None:
-    key = f"ratelimit:login:{identifier}"
-    client = get_redis_client()
-    if client:
-        try:
-            client.delete(key)
-        except Exception:
-            pass
-    _memory_rate_limit.pop(key, None)
+    with _login_lock:
+        _memory_rate_limit.pop(identifier.strip().casefold(), None)
 
 
 def get_cache_status() -> dict:

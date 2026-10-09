@@ -6,7 +6,7 @@ import re
 from zoneinfo import ZoneInfo
 
 from app.core.database import get_db
-from app.core.security import get_token_from_request, decode_access_token, require_roles
+from app.core.security import get_current_user, require_roles
 from app.core.notifications import log_and_dispatch_email
 
 router = APIRouter(prefix="/orders", tags=["Customer Orders & Consignments"])
@@ -104,13 +104,13 @@ class OrderTrackingResponse(BaseModel):
 
 
 @router.get("", response_model=List[OrderItemSchema])
-def list_customer_orders(request: Request, search: Optional[str] = None, status_filter: Optional[str] = None):
+def list_customer_orders(request: Request, search: Optional[str] = None, status_filter: Optional[str] = None,
+                         current_user: dict = Depends(require_roles(["CUSTOMER", "SUPERADMIN", "LOGISTICS_MGR", "DISPATCHER", "STORE_MGR", "WAREHOUSE_STAFF"]))):
     """
     Fetch all real customer orders from MySQL database.
     Scopes to logged-in customer if authenticated; otherwise returns the active company order history.
     """
-    token = get_token_from_request(request)
-    session_user = decode_access_token(token) if token else None
+    session_user = {"sub": current_user["user_id"], "role": current_user["role"]}
 
     with get_db() as conn:
         with conn.cursor() as cursor:
@@ -125,6 +125,8 @@ def list_customer_orders(request: Request, search: Optional[str] = None, status_
                 if cust:
                     where_clauses.append("co.customer_id = %s")
                     params.append(cust["customer_id"])
+                else:
+                    return []
 
             sql = f"""
                 SELECT 
@@ -243,7 +245,8 @@ def get_order_catalogue():
 
 
 @router.get("/{tracking_id}", response_model=OrderTrackingResponse)
-def get_order_tracking(tracking_id: str):
+def get_order_tracking(tracking_id: str,
+                       current_user: dict = Depends(require_roles(["CUSTOMER", "SUPERADMIN", "LOGISTICS_MGR", "DISPATCHER", "STORE_MGR", "WAREHOUSE_STAFF"]))):
     """
     Fetch comprehensive live shipment tracking milestones for a specific order.
     Accepts full tracking ID (e.g. KP-01001-CMB) or raw numeric order ID.
@@ -255,6 +258,10 @@ def get_order_tracking(tracking_id: str):
     with get_db() as conn:
         with conn.cursor() as cursor:
             if order_id:
+                if current_user["role"] == "CUSTOMER":
+                    cursor.execute("SELECT co.order_id FROM customer_order co JOIN customer c ON c.customer_id = co.customer_id WHERE co.order_id = %s AND c.user_id = %s", (order_id, current_user["user_id"]))
+                    if not cursor.fetchone():
+                        raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
                 cursor.execute(
                     """
                     SELECT 

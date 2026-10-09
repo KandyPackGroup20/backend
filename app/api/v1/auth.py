@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, Response, Depends, status, Request
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
+from app.core.config import settings
+from app.core.security import request_portal
 from app.core.database import get_db
 from app.core.security import (
     verify_password,
@@ -12,7 +14,8 @@ from app.core.security import (
 from app.core.cache import (
     check_rate_limit,
     record_login_failure,
-    reset_login_failures
+    reset_login_failures,
+    login_attempt_lock
 )
 import pymysql
 
@@ -24,7 +27,7 @@ router = APIRouter(prefix="/auth", tags=["Authentication & Identity (Feature 4.1
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
-    portal_type: str = "customer" # 'customer' or 'admin'
+    portal_type: Literal["customer", "admin"] = "customer" # 'customer' or 'admin'
 
 class LoginResponse(BaseModel):
     user_id: int
@@ -47,8 +50,9 @@ class CustomerRegisterRequest(BaseModel):
 class StaffCreateRequest(BaseModel):
     name: str = Field(min_length=2)
     email: EmailStr
-    role: str # 'LOGISTICS_MGR', 'DISPATCHER', 'STORE_MGR', 'WAREHOUSE_STAFF', 'DRIVER', 'ASSISTANT', 'SUPERADMIN'
-    password: str = Field(default="password123", min_length=6)
+    role: Literal["SUPERADMIN", "LOGISTICS_MGR", "DISPATCHER", "STORE_MGR", "WAREHOUSE_STAFF", "DRIVER", "ASSISTANT"] # 'LOGISTICS_MGR', 'DISPATCHER', 'STORE_MGR', 'WAREHOUSE_STAFF', 'DRIVER', 'ASSISTANT', 'SUPERADMIN'
+    password: str = Field(min_length=6)
+    license_number: Optional[str] = Field(default=None, max_length=100)
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -78,13 +82,21 @@ class ProfileUpdateRequest(BaseModel):
 @router.post("", response_model=LoginResponse, include_in_schema=False)
 @router.post("/", response_model=LoginResponse, include_in_schema=False)
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest, response: Response):
+def login(payload: LoginRequest, response: Response, request: Request):
+    with login_attempt_lock(payload.email):
+        return _login(payload, response, request)
+
+
+def _login(payload: LoginRequest, response: Response, request: Request):
+    portal = request_portal(request)
+    if payload.portal_type != portal:
+        raise HTTPException(status_code=403, detail="PORTAL_MISMATCH")
     # rate limit check
     allowed, remaining = check_rate_limit(payload.email, max_attempts=5, window_seconds=60)
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="TOO_MANY_FAILED_ATTEMPTS: Account temporarily locked due to excessive failed attempts. Please retry in 60 seconds."
+            detail="TOO_MANY_FAILED_ATTEMPTS: Account temporarily locked due to excessive failed attempts. Please retry after 15 minutes."
         )
 
     try:
@@ -105,11 +117,11 @@ def login(payload: LoginRequest, response: Response):
                     record_login_failure(payload.email, window_seconds=60)
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED, 
-                        detail="ACCOUNT_NOT_FOUND: User does not exist or account is inactive."
+                        detail="INVALID_CREDENTIALS: Incorrect email or password."
                     )
                 
                 # verify password
-                if not verify_password(payload.password, user['password_hash']) and payload.password != "password123":
+                if not verify_password(payload.password, user['password_hash']):
                     fails = record_login_failure(payload.email, window_seconds=60)
                     rem = max(0, 5 - fails)
                     raise HTTPException(
@@ -120,14 +132,14 @@ def login(payload: LoginRequest, response: Response):
                 reset_login_failures(payload.email)
 
                 # restrict customer from admin portal
-                if payload.portal_type == "admin" and user['role'] == "CUSTOMER":
+                if portal == "admin" and user['role'] == "CUSTOMER":
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="CUSTOMER_ACCESS_DENIED: Customer accounts cannot access the internal admin portal."
                     )
 
                 # check staff email domain
-                if payload.portal_type == "admin" and not payload.email.endswith("@kandypack.lk"):
+                if portal == "admin" and not payload.email.endswith("@kandypack.lk"):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
@@ -149,8 +161,8 @@ def login(payload: LoginRequest, response: Response):
                     value=access_token,
                     httponly=True,
                     samesite="lax",
-                    secure=False,
-                    max_age=3600 * 24 # 24 Hours
+                    secure=settings.SESSION_COOKIE_SECURE,
+                    max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
                 )
                 return {
                     "access_token": access_token,
@@ -164,20 +176,22 @@ def login(payload: LoginRequest, response: Response):
                 }
     except HTTPException:
         raise
+    except pymysql.IntegrityError:
+        raise HTTPException(status_code=409, detail="Account conflicts with an existing record or invalid reference.")
     except pymysql.OperationalError as op_err:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"DATABASE_UNAVAILABLE: Database connection failed. Please ensure the cloud database service is online and active. ({op_err})"
+            detail="DATABASE_UNAVAILABLE: Please try again later."
         )
     except pymysql.MySQLError as sql_err:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"DATABASE_ERROR: {str(sql_err)}"
+            detail="DATABASE_ERROR: Unable to complete this request."
         )
     except Exception as err:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LOGIN_FAILED: {str(err)}"
+            detail="LOGIN_FAILED: Unable to complete this request."
         )
 
 
@@ -185,7 +199,9 @@ def login(payload: LoginRequest, response: Response):
 # 2. Customer Registration Endpoint (Atomic Transaction & Parameterized)
     
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-def register_customer(payload: CustomerRegisterRequest, response: Response):
+def register_customer(payload: CustomerRegisterRequest, response: Response, request: Request):
+    if request_portal(request) != "customer":
+        raise HTTPException(status_code=403, detail="CUSTOMER_REGISTRATION_ONLY")
     try:
         with get_db() as conn:
             with conn.cursor() as cursor:
@@ -237,8 +253,8 @@ def register_customer(payload: CustomerRegisterRequest, response: Response):
                     value=access_token,
                     httponly=True,
                     samesite="lax",
-                    secure=False,
-                    max_age=3600 * 24
+                    secure=settings.SESSION_COOKIE_SECURE,
+                    max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
                 )
 
                 return {
@@ -251,20 +267,22 @@ def register_customer(payload: CustomerRegisterRequest, response: Response):
                 }
     except HTTPException:
         raise
+    except pymysql.IntegrityError:
+        raise HTTPException(status_code=409, detail="Account conflicts with an existing record or invalid reference.")
     except pymysql.OperationalError as op_err:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"DATABASE_UNAVAILABLE: Database connection failed. Please ensure the cloud database service is online and active. ({op_err})"
+            detail="DATABASE_UNAVAILABLE: Please try again later."
         )
     except pymysql.MySQLError as sql_err:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"DATABASE_ERROR: {str(sql_err)}"
+            detail="DATABASE_ERROR: Unable to complete this request."
         )
     except Exception as err:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"REGISTRATION_FAILED: {str(err)}"
+            detail="REGISTRATION_FAILED: Unable to complete this request."
         )
 
     
@@ -275,6 +293,8 @@ def create_staff_user(
     payload: StaffCreateRequest,
     current_user: dict = Depends(require_roles(["SUPERADMIN"]))
 ):
+    if payload.role in {"DRIVER", "ASSISTANT"} and not (payload.license_number or "").strip():
+        raise HTTPException(status_code=422, detail="Delivery staff require a license/staff reference number.")
     with get_db() as conn:
         with conn.cursor() as cursor:
             # Check duplicate email
@@ -295,6 +315,7 @@ def create_staff_user(
                         detail="SECURITY POLICY VIOLATION: Internal staff users must have an email ending with @kandypack.lk"
                     )
 
+                cursor.execute("SET @kandypack_staff_provisioning = 1")
                 cursor.execute(
                     """
                     INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
@@ -303,12 +324,18 @@ def create_staff_user(
                     (payload.name, payload.role, payload.email, pw_hash)
                 )
                 user_id = cursor.lastrowid
+                if payload.role in {"DRIVER", "ASSISTANT"}:
+                    cursor.execute("INSERT INTO delivery_staff (user_id, license_number, work_hours) VALUES (%s, %s, 0)", (user_id, payload.license_number))
                 conn.commit()
+            except HTTPException:
+                raise
+            except pymysql.IntegrityError:
+                raise HTTPException(status_code=409, detail="Account conflicts with an existing record.")
             except Exception as e:
                 err_msg = str(e)
                 if "SECURITY POLICY VIOLATION" in err_msg:
                     raise HTTPException(status_code=400, detail=err_msg)
-                raise HTTPException(status_code=500, detail=f"Database error: {err_msg}")
+                raise HTTPException(status_code=500, detail="Staff creation failed; no account was created.")
 
             return {
                 "user_id": user_id,
@@ -366,13 +393,15 @@ def change_password(
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
 
-            if not verify_password(payload.current_password, user["password_hash"]) and payload.current_password != "password123":
+            if not verify_password(payload.current_password, user["password_hash"]):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="INVALID_CURRENT_PASSWORD: The current password you entered is incorrect."
                 )
 
             new_hash = get_password_hash(payload.new_password)
+            if verify_password(payload.new_password, user["password_hash"]):
+                raise HTTPException(status_code=400, detail="Choose a different password.")
             cursor.execute(
                 "UPDATE user SET password_hash = %s, force_password_reset = 0 WHERE user_id = %s",
                 (new_hash, current_user["user_id"])
@@ -392,8 +421,8 @@ def change_password(
                 value=new_token,
                 httponly=True,
                 samesite="lax",
-                secure=False,
-                max_age=3600 * 24
+                secure=settings.SESSION_COOKIE_SECURE,
+                max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
             )
 
             return {
@@ -449,29 +478,14 @@ def update_current_user_profile(
                 (payload.name, current_user["user_id"])
             )
 
-            # Upsert into customer table so all accounts (staff and customers) have persistent contact details
-            phone_val = payload.phone or "0770000000"
-            addr_val = payload.address_line or "Kandy Logistics Central Store"
-            city_val = payload.city or "Colombo"
-
-            cursor.execute(
-                """
-                INSERT INTO customer (user_id, customer_name, route_id, phone, address_line, city, postal_code)
-                VALUES (%s, %s, 1, %s, %s, %s, '20000')
-                ON DUPLICATE KEY UPDATE 
-                    customer_name = VALUES(customer_name),
-                    phone = VALUES(phone),
-                    address_line = VALUES(address_line),
-                    city = VALUES(city)
-                """,
-                (
-                    current_user["user_id"],
-                    payload.name,
-                    phone_val,
-                    addr_val,
-                    city_val
+            # Staff profiles must never create customer identities or overwrite routing.
+            if current_user["role"] == "CUSTOMER":
+                cursor.execute(
+                    """UPDATE customer SET customer_name = %s,
+                       phone = COALESCE(%s, phone), address_line = COALESCE(%s, address_line),
+                       city = COALESCE(%s, city) WHERE user_id = %s""",
+                    (payload.name, payload.phone, payload.address_line, payload.city, current_user["user_id"])
                 )
-            )
             conn.commit()
 
             cursor.execute(
@@ -502,8 +516,8 @@ def update_current_user_profile(
                 value=new_token,
                 httponly=True,
                 samesite="lax",
-                secure=False,
-                max_age=3600 * 24
+                secure=settings.SESSION_COOKIE_SECURE,
+                max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
             )
 
             return {

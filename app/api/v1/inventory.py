@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from app.core.database import get_db
-from app.core.security import get_current_user, require_roles, create_access_token
+from app.core.security import require_roles
 
 router = APIRouter(prefix="/inventory", tags=["Station Inventory & Warehouse (Feature 4.4)"])
 
@@ -135,7 +135,7 @@ def assign_bin_location(
         with conn.cursor() as cursor:
             if payload.location_id is not None:
                 cursor.execute(
-                    """SELECT sl.location_id 
+                    """SELECT sl.location_id
                        FROM storage_location sl
                        JOIN inventory inv ON sl.station_id = inv.station_id
                        WHERE inv.inventory_id = %s AND sl.location_id = %s""",
@@ -282,7 +282,7 @@ def get_inventory_summary_report(
     with get_db() as conn:
         with conn.cursor() as cursor:
             stock_query = """
-                SELECT 
+                SELECT
                     COUNT(DISTINCT inv.product_id) AS total_distinct_products,
                     IFNULL(SUM(inv.stored_quantity), 0) AS total_stored_quantity,
                     IFNULL(SUM(inv.stored_quantity * p.unit_price), 0.00) AS total_inventory_value
@@ -326,42 +326,5 @@ def get_inventory_summary_report(
 
 @router.post("/session")
 def create_station_session(payload: StationAuthRequest, response: Response):
-    """Feature 4.4: Issue authenticated Bearer session token for warehouse operators."""
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            if payload.email:
-                cursor.execute(
-                    "SELECT user_id, name, email, role, force_password_reset FROM user WHERE email = %s AND is_active = 1 LIMIT 1",
-                    (payload.email,)
-                )
-            else:
-                cursor.execute(
-                    "SELECT user_id, name, email, role, force_password_reset FROM user WHERE role = %s AND is_active = 1 LIMIT 1",
-                    (payload.role,)
-                )
-            user = cursor.fetchone()
-            if not user:
-                raise HTTPException(status_code=404, detail="OPERATOR_NOT_FOUND: Active user account not found.")
-
-            token = create_access_token(data={
-                "sub": str(user["user_id"]),
-                "email": user["email"],
-                "name": user["name"],
-                "role": user["role"],
-                "force_password_reset": bool(user["force_password_reset"])
-            })
-
-            response.set_cookie(
-                key="kandypack_session",
-                value=token,
-                httponly=True,
-                samesite="lax",
-                secure=False,
-                max_age=3600 * 24
-            )
-
-            return {
-                "access_token": token,
-                "token_type": "bearer",
-                "user": user
-            }
+    """Legacy passwordless login is disabled; use the central authentication flow."""
+    raise HTTPException(status_code=410, detail="Use /api/v1/auth/login with your password.")

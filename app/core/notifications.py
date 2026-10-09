@@ -89,6 +89,74 @@ def log_and_dispatch_email(
     print(f"   Time: {timestamp}")
     return True
 
+def ensure_notification_table() -> bool:
+    """Idempotently creates the notification table if it does not exist, and seeds historic alerts if empty."""
+    try:
+        from app.core.database import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS notification (
+                        notification_id INT AUTO_INCREMENT PRIMARY KEY,
+                        user_id INT NULL,
+                        recipient_email VARCHAR(255) NOT NULL,
+                        notification_type VARCHAR(50) NOT NULL DEFAULT 'NEW_CONSIGNMENT',
+                        title VARCHAR(255) NOT NULL,
+                        message TEXT NOT NULL,
+                        order_id INT NULL,
+                        is_read TINYINT DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_notification_user (user_id),
+                        INDEX idx_notification_order (order_id),
+                        INDEX idx_notification_read (is_read),
+                        INDEX idx_notification_time (created_at DESC)
+                    ) ENGINE=InnoDB;
+                """)
+                conn.commit()
+
+                # Seed initial alerts if empty and orders exist
+                try:
+                    cur.execute("SELECT COUNT(*) AS cnt FROM notification")
+                    cnt_row = cur.fetchone()
+                    if cnt_row and cnt_row.get("cnt", 0) == 0:
+                        cur.execute("""
+                            SELECT co.order_id, co.status, co.created_at, c.customer_name, c.city
+                            FROM customer_order co
+                            JOIN customer c ON co.customer_id = c.customer_id
+                            ORDER BY co.order_id ASC
+                            LIMIT 15
+                        """)
+                        orders = cur.fetchall()
+                        if orders:
+                            cur.execute("SELECT user_id, email FROM user WHERE role = 'LOGISTICS_MGR' LIMIT 1")
+                            mgr = cur.fetchone()
+                            mgr_id = mgr["user_id"] if mgr else 2
+                            mgr_email = mgr["email"] if mgr else "logistics@kandypack.lk"
+
+                            for idx, o in enumerate(orders):
+                                is_read_val = 1 if idx < len(orders) - 2 else 0
+                                city = o.get("city") or "Colombo"
+                                title = f"New Consignment KP-{o['order_id']:05d} Awaiting Rail Scheduling"
+                                msg = f"Customer {o['customer_name']} placed a consignment to {city} Goods Shed. Status: {o['status']}."
+                                cur.execute("""
+                                    INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                                    VALUES (%s, %s, 'NEW_CONSIGNMENT', %s, %s, %s, %s, %s)
+                                """, (mgr_id, mgr_email, title, msg, o["order_id"], is_read_val, o["created_at"]))
+                            conn.commit()
+                            logger.info(f"Seeded {len(orders)} notifications for logistics manager.")
+                except Exception as seed_err:
+                    logger.warning(f"Could not seed initial notifications: {seed_err}")
+
+                return True
+    except Exception as e:
+        logger.error(f"Error ensuring notification table: {e}")
+        return False
+
+def _is_table_missing(e: Exception) -> bool:
+    if hasattr(e, "args") and len(e.args) > 0:
+        return e.args[0] == 1146 or "1146" in str(e.args[0])
+    return "1146" in str(e)
+
 def create_database_notification(
     recipient_email: str,
     title: str,
@@ -97,8 +165,8 @@ def create_database_notification(
     order_id: Optional[int] = None,
     user_id: Optional[int] = None
 ) -> Optional[int]:
-    """Inserts a real persistent alert into the MySQL notification table."""
-    try:
+    """Inserts a real persistent alert into the MySQL notification table with self-healing migration."""
+    def _insert():
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -112,7 +180,17 @@ def create_database_notification(
                 )
                 conn.commit()
                 return cur.lastrowid
+
+    try:
+        return _insert()
     except Exception as e:
+        if _is_table_missing(e):
+            if ensure_notification_table():
+                try:
+                    return _insert()
+                except Exception as retry_err:
+                    logger.error(f"Error creating DB notification after auto-migration: {retry_err}")
+                    return None
         logger.error(f"Error creating DB notification: {e}")
         return None
 
@@ -129,7 +207,7 @@ def get_recent_notifications(
     if not user_id and not user_role and not user_email:
         return []
 
-    try:
+    def _query():
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -182,7 +260,17 @@ def get_recent_notifications(
                 params.append(limit)
                 cur.execute(sql, tuple(params))
                 return cur.fetchall()
+
+    try:
+        return _query()
     except Exception as e:
+        if _is_table_missing(e):
+            if ensure_notification_table():
+                try:
+                    return _query()
+                except Exception as retry_err:
+                    logger.warning(f"Error reading DB notifications after auto-migration: {retry_err}")
+                    return []
         logger.warning(f"Error reading DB notifications: {e}")
         return []
 
@@ -195,7 +283,7 @@ def get_unread_notification_count(
     if not user_id and not user_role and not user_email:
         return 0
 
-    try:
+    def _query():
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -212,7 +300,17 @@ def get_unread_notification_count(
                 cur.execute(f"SELECT COUNT(*) AS cnt FROM notification WHERE {' AND '.join(conditions)}", tuple(params))
                 res = cur.fetchone()
                 return res["cnt"] if res else 0
+
+    try:
+        return _query()
     except Exception as e:
+        if _is_table_missing(e):
+            if ensure_notification_table():
+                try:
+                    return _query()
+                except Exception as retry_err:
+                    logger.warning(f"Error fetching unread count after auto-migration: {retry_err}")
+                    return 0
         logger.warning(f"Error fetching unread count: {e}")
         return 0
 
@@ -223,7 +321,7 @@ def mark_notification_as_read(
     user_email: Optional[str] = None
 ) -> bool:
     """Marks a single alert as read with ownership verification."""
-    try:
+    def _update():
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -237,7 +335,16 @@ def mark_notification_as_read(
                 cur.execute(f"UPDATE notification SET is_read = 1 WHERE {' AND '.join(conditions)}", tuple(params))
                 conn.commit()
                 return cur.rowcount > 0
+
+    try:
+        return _update()
     except Exception as e:
+        if _is_table_missing(e):
+            if ensure_notification_table():
+                try:
+                    return _update()
+                except Exception:
+                    return False
         logger.error(f"Error marking notification {notification_id} as read: {e}")
         return False
 
@@ -247,7 +354,7 @@ def mark_all_notifications_as_read(
     user_email: Optional[str] = None
 ) -> int:
     """Marks all unread alerts authorized for this user as read."""
-    try:
+    def _update():
         from app.core.database import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -264,7 +371,16 @@ def mark_all_notifications_as_read(
                 cur.execute(f"UPDATE notification SET is_read = 1 WHERE {' AND '.join(conditions)}", tuple(params))
                 conn.commit()
                 return cur.rowcount
+
+    try:
+        return _update()
     except Exception as e:
+        if _is_table_missing(e):
+            if ensure_notification_table():
+                try:
+                    return _update()
+                except Exception:
+                    return 0
         logger.error(f"Error marking all notifications as read: {e}")
         return 0
 

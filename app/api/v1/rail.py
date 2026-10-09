@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import datetime, time, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import pymysql
 
 from app.core.database import get_db
@@ -12,6 +14,15 @@ router = APIRouter(prefix="/rail", tags=["Rail Allocation & Schedules (Feature 4
 
 # Roles allowed to access rail management endpoints
 RAIL_ROLES = ["SUPERADMIN", "LOGISTICS_MGR"]
+RAIL_DESTINATIONS = ("Colombo", "Negombo", "Galle", "Matara", "Jaffna", "Trincomalee")
+RAIL_TIMEZONE = ZoneInfo("Asia/Colombo")
+
+
+def local_rail_datetime(value):
+    # MySQL DATETIME is the existing Sri Lanka wall-clock contract.
+    if value is not None and value.tzinfo is not None:
+        return value.astimezone(RAIL_TIMEZONE).replace(tzinfo=None)
+    return value
 
 # Stored procedure result code -> HTTP status
 RESULT_HTTP_STATUS = {
@@ -22,6 +33,7 @@ RESULT_HTTP_STATUS = {
     "ORIGIN_HUB_NOT_FOUND": 422,
     "ORDER_HAS_NO_ITEMS": 422,
     "INVALID_PRODUCT_SPACE_RATE": 422,
+    "INVALID_ORDER_QUANTITY": 422,
     "CANNOT_REVERSE_DEPARTED_OR_INACTIVE_TRIP": 409,
     "DEADLOCK_RETRY": 503,
     "ERROR_TRANSACTION_FAILED": 500,
@@ -33,8 +45,8 @@ RESULT_HTTP_STATUS = {
 # ==========================================
 
 class RailAllocateRequest(BaseModel):
-    order_id: int
-    trip_id: Optional[int] = None
+    order_id: int = Field(gt=0)
+    trip_id: Optional[int] = Field(default=None, gt=0)
 
 class ReverseAllocateRequest(BaseModel):
     order_id: int
@@ -44,12 +56,26 @@ class CreateTripRequest(BaseModel):
     destination_station_id: int
     departure_datetime: datetime
     arrival_datetime: datetime
-    total_capacity: float = Field(gt=0, description="Total train carriage capacity in space units")
+    total_capacity: Decimal = Field(gt=0, max_digits=10, decimal_places=2, description="Total train carriage capacity in space units")
+
+    _local_time = field_validator("departure_datetime", "arrival_datetime")(local_rail_datetime)
 
 class UpdateTripRequest(BaseModel):
-    total_capacity: Optional[float] = Field(default=None, gt=0)
+    total_capacity: Optional[Decimal] = Field(default=None, gt=0, max_digits=10, decimal_places=2)
     departure_datetime: Optional[datetime] = None
     arrival_datetime: Optional[datetime] = None
+
+    _local_time = field_validator("departure_datetime", "arrival_datetime")(local_rail_datetime)
+
+
+@router.get("/stations")
+def list_rail_stations(current_user: dict = Depends(require_roles(RAIL_ROLES))):
+    """Actual active hub identifiers for the existing schedule form."""
+    with get_db() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT station_id, city FROM station_store WHERE is_active = 1 AND city IN ('Kandy','Colombo','Negombo','Galle','Matara','Jaffna','Trincomalee') ORDER BY city, station_id")
+        stations = cursor.fetchall()
+    return {"origins": [s for s in stations if s["city"] == "Kandy"],
+            "destinations": [s for s in stations if s["city"] in RAIL_DESTINATIONS]}
 
 
 # ==========================================
@@ -114,6 +140,9 @@ def create_train_trip(
             detail="Arrival datetime must be strictly after departure datetime."
         )
 
+    if payload.departure_datetime <= datetime.now(RAIL_TIMEZONE).replace(tzinfo=None):
+        raise HTTPException(status_code=422, detail="Departure must be in the future (Asia/Colombo).")
+
     if payload.total_capacity <= 0:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -123,12 +152,12 @@ def create_train_trip(
     with get_db() as conn:
         with conn.cursor() as cursor:
             # 2. Origin Hub Verification (LM-03: must be Kandy)
-            cursor.execute("SELECT station_id, city FROM station_store WHERE city = 'Kandy' LIMIT 1")
+            cursor.execute("SELECT station_id, city FROM station_store WHERE city = 'Kandy' AND is_active = 1 AND station_id = %s", (payload.origin_station_id,))
             kandy_row = cursor.fetchone()
             if not kandy_row:
                 raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Kandy station hub is not configured in the database."
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Origin must reference an active Kandy station."
                 )
 
             if payload.origin_station_id != kandy_row["station_id"]:
@@ -138,13 +167,15 @@ def create_train_trip(
                 )
 
             # 3. Verify destination station exists
-            cursor.execute("SELECT station_id, city FROM station_store WHERE station_id = %s", (payload.destination_station_id,))
+            cursor.execute("SELECT station_id, city FROM station_store WHERE station_id = %s AND is_active = 1", (payload.destination_station_id,))
             dest_row = cursor.fetchone()
             if not dest_row:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Destination station #{payload.destination_station_id} does not exist."
                 )
+            if dest_row["city"] not in RAIL_DESTINATIONS:
+                raise HTTPException(status_code=422, detail="Destination must be one of the six supported rail hubs.")
 
             # 4. Insert trip into DB (DB CHECKs verify chk_trip_capacity_positive, chk_trip_time_order, chk_trip_distinct_stations)
             try:
@@ -273,10 +304,18 @@ def update_train_trip(
             if not trip:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Train trip #{trip_id} not found.")
 
+            if trip["status"] != "SCHEDULED" or trip["departure_datetime"] <= datetime.now(RAIL_TIMEZONE).replace(tzinfo=None):
+                raise HTTPException(status_code=409, detail="Only future scheduled trips may be edited.")
             new_cap = payload.total_capacity if payload.total_capacity is not None else float(trip["total_capacity"])
             new_dep = payload.departure_datetime if payload.departure_datetime is not None else trip["departure_datetime"]
             new_arr = payload.arrival_datetime if payload.arrival_datetime is not None else trip["arrival_datetime"]
 
+            if new_dep <= datetime.now(RAIL_TIMEZONE).replace(tzinfo=None):
+                raise HTTPException(status_code=422, detail="Departure must be in the future (Asia/Colombo).")
+            cursor.execute("SELECT MIN(co.delivery_date) AS cutoff FROM rail_allocation ra JOIN order_item oi ON oi.order_item_id=ra.order_item_id JOIN customer_order co ON co.order_id=oi.order_id WHERE ra.trip_id=%s", (trip_id,))
+            cutoff = cursor.fetchone()["cutoff"]
+            if cutoff and new_arr >= datetime.combine(cutoff + timedelta(days=1), time.min):
+                raise HTTPException(status_code=409, detail="Updated arrival would miss an allocated order's delivery cutoff.")
             if new_arr <= new_dep:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -383,6 +422,8 @@ def activate_train_trip(
             if not trip:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Train trip #{trip_id} not found.")
 
+            if trip["status"] not in {"CANCELLED", "SCHEDULED"} or trip["departure_datetime"] <= datetime.now(RAIL_TIMEZONE).replace(tzinfo=None):
+                raise HTTPException(status_code=409, detail="Only future cancelled trips may be reactivated.")
             cursor.execute("UPDATE train_trip SET status = 'SCHEDULED' WHERE trip_id = %s", (trip_id,))
             cursor.execute(
                 """
@@ -423,7 +464,7 @@ def list_pending_rail_orders(
                        co.status
                 FROM customer_order co
                 JOIN customer c ON c.customer_id = co.customer_id
-                JOIN delivery_route dr ON dr.route_id = c.route_id
+                JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
                 JOIN station_store ss ON ss.station_id = dr.station_id
                 WHERE co.status = 'PENDING_RAIL_SCHEDULING'
                 ORDER BY co.delivery_date ASC, co.order_id ASC
@@ -475,7 +516,7 @@ def get_suitable_trips_for_order(
                 SELECT co.order_id, co.status, co.delivery_date, dr.station_id AS dest_station_id, ss.city AS dest_city
                 FROM customer_order co
                 JOIN customer c ON c.customer_id = co.customer_id
-                JOIN delivery_route dr ON dr.route_id = c.route_id
+                JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
                 JOIN station_store ss ON ss.station_id = dr.station_id
                 WHERE co.order_id = %s
                 """,
@@ -489,9 +530,11 @@ def get_suitable_trips_for_order(
             delivery_date = order_info["delivery_date"]
 
             # 2. Resolve Kandy Station ID
-            cursor.execute("SELECT station_id FROM station_store WHERE city = 'Kandy' LIMIT 1")
+            cursor.execute("SELECT station_id FROM station_store WHERE city = 'Kandy' AND is_active = 1 ORDER BY station_id LIMIT 1")
             kandy_row = cursor.fetchone()
-            kandy_station_id = kandy_row["station_id"] if kandy_row else 7
+            if not kandy_row:
+                raise HTTPException(status_code=422, detail="Active Kandy hub is not configured.")
+            kandy_station_id = kandy_row["station_id"]
 
             # 3. Query suitable trips matching exact sp_schedule_train_order criteria
             cursor.execute(
@@ -510,7 +553,8 @@ def get_suitable_trips_for_order(
                 WHERE tt.origin_station_id = %s
                   AND tt.destination_station_id = %s
                   AND tt.status = 'SCHEDULED'
-                  AND tt.departure_datetime > NOW()
+                  AND NOT EXISTS (SELECT 1 FROM manifest m WHERE m.trip_id=tt.trip_id AND m.status='RECEIVED')
+                  AND tt.departure_datetime > CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+05:30')
                   AND tt.arrival_datetime < %s + INTERVAL 1 DAY
                 ORDER BY tt.departure_datetime ASC, tt.trip_id ASC
                 """,
@@ -541,86 +585,80 @@ def allocate_rail_capacity(
     payload: RailAllocateRequest,
     current_user: dict = Depends(require_roles(RAIL_ROLES)),
 ):
+    for attempt in range(3):
+        try:
+            return _allocate_rail_capacity(payload, current_user)
+        except pymysql.MySQLError as error:
+            code = error.args[0] if error.args else None
+            if code in (1205, 1213) and attempt < 2:
+                continue
+            if code in (1205, 1213):
+                raise HTTPException(status_code=503, detail="DEADLOCK_RETRY: Please retry allocation.")
+            raise HTTPException(status_code=400 if code == 1644 else 503,
+                                detail="Allocation could not be completed. Refresh the order and trip state before retrying.")
+
+
+def _allocate_rail_capacity(payload: RailAllocateRequest, current_user: dict):
     """Execute row-locked rail capacity allocation: specific chosen trip or multi-trip spillover."""
     with get_db() as conn:
         with conn.cursor() as cursor:
             status_code = "UNKNOWN"
             if payload.trip_id:
-                # Direct allocation to user's explicitly selected train
+                # Use the same lock order as the automatic scheduler: order, then trip.
                 cursor.execute(
-                    """
-                    SELECT tt.trip_id, tt.origin_station_id, tt.destination_station_id,
-                           tt.departure_datetime, tt.arrival_datetime,
-                           fn_trip_remaining_capacity(tt.trip_id) AS remaining_space
-                    FROM train_trip tt
-                    WHERE tt.trip_id = %s AND tt.status = 'SCHEDULED'
-                    FOR UPDATE
-                    """,
-                    (payload.trip_id,)
+                    """SELECT co.status, co.delivery_date, dr.station_id AS dest_station_id
+                       FROM customer_order co JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                       WHERE co.order_id = %s FOR UPDATE""", (payload.order_id,)
+                )
+                order = cursor.fetchone()
+                if not order:
+                    raise HTTPException(status_code=404, detail="Order not found.")
+                if order["status"] != "PENDING_RAIL_SCHEDULING":
+                    raise HTTPException(status_code=409, detail="INVALID_ORDER_STATUS")
+                cursor.execute(
+                    """SELECT tt.*, origin.city AS origin_city, destination.city AS destination_city,
+                              origin.is_active AS origin_active, destination.is_active AS destination_active
+                       FROM train_trip tt
+                       JOIN station_store origin ON origin.station_id=tt.origin_station_id
+                       JOIN station_store destination ON destination.station_id=tt.destination_station_id
+                       WHERE trip_id = %s FOR UPDATE""", (payload.trip_id,)
                 )
                 trip = cursor.fetchone()
                 if not trip:
-                    raise HTTPException(status_code=404, detail="Selected train trip not found or not scheduled.")
-
+                    raise HTTPException(status_code=404, detail="Selected train trip not found.")
+                if (trip["status"] != "SCHEDULED" or trip["origin_city"] != "Kandy"
+                    or trip["destination_city"] not in RAIL_DESTINATIONS
+                    or not trip["origin_active"] or not trip["destination_active"]
+                    or trip["destination_station_id"] != order["dest_station_id"]
+                    or trip["departure_datetime"] <= datetime.now(RAIL_TIMEZONE).replace(tzinfo=None)
+                    or trip["arrival_datetime"] >= datetime.combine(order["delivery_date"] + timedelta(days=1), time.min)):
+                    raise HTTPException(status_code=422, detail="Selected trip is not eligible for this order and delivery cutoff.")
                 cursor.execute(
-                    """
-                    SELECT co.status, co.delivery_date, dr.station_id AS dest_station_id
-                    FROM customer_order co
-                    JOIN customer c ON c.customer_id = co.customer_id
-                    JOIN delivery_route dr ON dr.route_id = c.route_id
-                    WHERE co.order_id = %s
-                    FOR UPDATE
-                    """,
-                    (payload.order_id,)
-                )
-                ord_info = cursor.fetchone()
-                if not ord_info:
-                    raise HTTPException(status_code=404, detail="Order not found in database.")
-                if ord_info["status"] != "PENDING_RAIL_SCHEDULING":
-                    raise HTTPException(status_code=409, detail="Order is not in PENDING_RAIL_SCHEDULING.")
-                if ord_info["dest_station_id"] != trip["destination_station_id"]:
-                    raise HTTPException(status_code=400, detail="Train destination does not match order delivery destination.")
-
-                cursor.execute(
-                    """
-                    SELECT oi.order_item_id, oi.quantity, p.space_consumption_rate,
-                           (oi.quantity * p.space_consumption_rate) AS item_space
-                    FROM order_item oi
-                    JOIN product p ON p.product_id = oi.product_id
-                    WHERE oi.order_id = %s
-                    """,
-                    (payload.order_id,)
+                    """SELECT oi.order_item_id, oi.quantity, p.space_consumption_rate,
+                              fn_order_item_space(oi.order_item_id, oi.quantity) AS item_space
+                       FROM order_item oi JOIN product p ON p.product_id=oi.product_id
+                       WHERE oi.order_id=%s ORDER BY oi.order_item_id FOR UPDATE""", (payload.order_id,)
                 )
                 items = cursor.fetchall()
-                total_needed = sum(float(i["item_space"]) for i in items)
-
-                if float(trip["remaining_space"]) < total_needed:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Selected train only has {float(trip['remaining_space']):.1f} space units available, but order requires {total_needed:.1f} units. Use Auto Multi-Trip Spillover to split across multiple trains."
-                    )
-
-                for it in items:
+                if not items:
+                    raise HTTPException(status_code=422, detail="ORDER_HAS_NO_ITEMS")
+                if any(i["quantity"] <= 0 or i["space_consumption_rate"] <= 0 for i in items):
+                    raise HTTPException(status_code=422, detail="Order quantities and product space rates must be positive.")
+                cursor.execute("SELECT COALESCE(SUM(allocated_space),0) AS used FROM rail_allocation WHERE trip_id=%s FOR UPDATE", (payload.trip_id,))
+                remaining = trip["total_capacity"] - cursor.fetchone()["used"]
+                if sum((i["item_space"] for i in items), Decimal(0)) > remaining:
+                    raise HTTPException(status_code=400, detail="INSUFFICIENT_RAIL_CAPACITY: Use automatic spillover to split this order.")
+                cursor.execute("SELECT status FROM manifest WHERE trip_id=%s FOR UPDATE", (payload.trip_id,))
+                if any(m["status"] == "RECEIVED" for m in cursor.fetchall()):
+                    raise HTTPException(status_code=409, detail="The selected train manifest has already been received.")
+                for item in items:
                     cursor.execute(
-                        """
-                        INSERT INTO rail_allocation (order_item_id, trip_id, allocated_quantity, allocated_space, allocated_by)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (it["order_item_id"], payload.trip_id, it["quantity"], it["item_space"], current_user["user_id"])
+                        "INSERT INTO rail_allocation (order_item_id,trip_id,allocated_quantity,allocated_space,allocated_by) VALUES (%s,%s,%s,%s,%s)",
+                        (item["order_item_id"],payload.trip_id,item["quantity"],item["item_space"],current_user["user_id"])
                     )
-
-                cursor.execute(
-                    "UPDATE customer_order SET status = 'SCHEDULED_FOR_RAIL' WHERE order_id = %s",
-                    (payload.order_id,)
-                )
-
-                cursor.execute(
-                    """
-                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
-                    VALUES (%s, 'SCHEDULE_RAIL_ORDER', %s, 'SUCCESS_SINGLE_TRIP', 'customer_order')
-                    """,
-                    (current_user["user_id"], payload.order_id)
-                )
+                cursor.execute("UPDATE customer_order SET status='SCHEDULED_FOR_RAIL' WHERE order_id=%s", (payload.order_id,))
+                cursor.execute("INSERT INTO order_status_history (status,order_id,changed_by) VALUES ('SCHEDULED_FOR_RAIL',%s,%s)", (payload.order_id,current_user["user_id"]))
+                cursor.execute("INSERT INTO audit_log (user_id,action,entity_id,outcome,entity_name) VALUES (%s,'SCHEDULE_RAIL_ORDER',%s,'SUCCESS_SINGLE_TRIP','customer_order')", (current_user["user_id"],payload.order_id))
                 status_code = "SUCCESS_SINGLE_TRIP"
             else:
                 # Multi-trip spillover algorithm
@@ -648,13 +686,13 @@ def allocate_rail_capacity(
             # Allocation breakdown for presentation
             cursor.execute(
                 """
-                SELECT ra.allocation_id, oi.order_id, tt.trip_id, tt.departure_datetime,
+                SELECT ra.allocation_id, ra.order_item_id, oi.order_id, tt.trip_id, tt.departure_datetime,
                        ra.allocated_quantity, ra.allocated_space
                 FROM rail_allocation ra
                 JOIN order_item oi ON ra.order_item_id = oi.order_item_id
                 JOIN train_trip tt ON ra.trip_id = tt.trip_id
                 WHERE oi.order_id = %s
-                ORDER BY tt.departure_datetime ASC, ra.allocation_id ASC
+                ORDER BY tt.departure_datetime ASC, tt.trip_id ASC, ra.allocation_id ASC
                 """,
                 (payload.order_id,)
             )
@@ -724,6 +762,9 @@ def get_order_allocations(
     """View trip-by-trip allocation breakdown for an order (LM-19)."""
     with get_db() as conn:
         with conn.cursor() as cursor:
+            cursor.execute("SELECT order_id FROM customer_order WHERE order_id=%s", (order_id,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Order not found.")
             cursor.execute(
                 """
                 SELECT ra.allocation_id, ra.order_item_id, ra.trip_id,
@@ -732,7 +773,7 @@ def get_order_allocations(
                 JOIN order_item oi ON oi.order_item_id = ra.order_item_id
                 JOIN train_trip tt ON tt.trip_id = ra.trip_id
                 WHERE oi.order_id = %s
-                ORDER BY tt.departure_datetime ASC, ra.allocation_id ASC
+                ORDER BY tt.departure_datetime ASC, tt.trip_id ASC, ra.allocation_id ASC
                 """,
                 (order_id,)
             )

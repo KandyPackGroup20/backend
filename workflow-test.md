@@ -58,3 +58,46 @@ Registration establishes customer ownership for ordering. Delivery provisioning 
 The schema has customer ownership and global staff roles, not independent organization tenants or universal station-staff membership. No new tenant or station-assignment model was invented. SQL database roles were inspected statically, but live server-global grant isolation was not tested. Production TLS, reverse proxy origins/cookies, and browser interaction remain deployment/UI checks. Stateless bearer tokens still expire by JWT lifetime; logout clears the browser cookie rather than maintaining a token revocation registry.
 
 Approval: ready for Phase 1 code review with the above explicit deployment requirements; not a claim that the full logistics lifecycle or production deployment is approved.
+
+## Member: Phase 2 — Rail Capacity Allocation and Spillover (Feature 4.2) — 2026-10-10
+
+Scope: existing rail APIs, allocation transactions, actual destination/time/space contracts, and necessary station-manifest handoff. `fullworkflow` was initially clean with Phase 1 in the baseline. Prior entries were preserved; no README/prompt/main edits, pushes or merges.
+
+### Existing behavior and defects fixed
+
+Trip CRUD, pending orders, suitable-trip lookup, stored-procedure auto-allocation, breakdowns, reversal and Logistics Manager/SuperAdmin authorization already existed. FastAPI, PyMySQL and parameterized SQL remain the implementation. Existing `/api/v1/rail/trips`, `/orders/pending`, `/allocate`, `/orders/{order_id}/allocations` contracts are retained rather than duplicating the prompt's unversioned/renamed routes.
+
+`app/api/v1/rail.py` changes:
+
+- Manual allocation and suitable-trip lookup used the customer's mutable profile route instead of the order's committed delivery route. Both now use `customer_order.delivery_route_id` consistently with the stored procedure.
+- Selected trips now require active supported hubs, a future scheduled departure, matching order destination, arrival before the delivery-date cutoff and an unreceived manifest. Empty/nonpositive item quantities and invalid rates are rejected.
+- Manual allocation locks order before trip, uses exact Decimal/rounded function results and current capacity reads, writes missing order-status history, and shares bounded deadlock/timeout retries with the automatic path. Duplicate allocations fail on the locked order state.
+- Schedule inputs normalize offset-aware timestamps to Asia/Colombo before writing existing MySQL DATETIME fields. Capacities use two-decimal Decimal validation instead of float. Past trip creation/edits, inactive trip edits and edits missing existing order deadlines are rejected; departed/arrived trips cannot be reactivated.
+- Supported destination validation and `/api/v1/rail/stations` supply real active IDs to the existing form, replacing its erroneous seed-ID assumptions. This endpoint is a missing data connection, not an alias of an existing API.
+- Allocation replies include the existing order-item identity; breakdowns sort by departure, trip and allocation ID. Unknown-order breakdowns return 404.
+
+Other changed files: `tests/test_phase2_rail.py` (real DB regression suite) and this appended `workflow-test.md` section. No backend ORM or business-feature rewrite was introduced.
+
+### SQL initialization / transaction ownership
+
+Apply sibling database `15_phase2_rail_workflow.sql` to the explicitly selected initialized database, with rail writes paused. It installs the capacity/quantity locking fixes, active-hub guards, received-cargo protection and atomic pending-manifest handoff, and repairs only unambiguous future missing manifests. See the database workflow section for exact sources and migration precautions. No existing DB was migrated in this session.
+
+The stored procedure owns its existing START TRANSACTION/COMMIT/ROLLBACK; the backend does not pretend it can wrap that commit in a larger transaction. The selected-trip path owns its connection transaction. Failed allocation rolls back allocation/manifest/order/history writes; rejection audit records from the existing automatic procedure may intentionally persist after rollback. Capacity remains derived rather than duplicated in a new field.
+
+### Tests and results
+
+Run from backend: `.venv/Scripts/python.exe -m unittest discover -s tests -p test_phase2_rail.py -v`.
+
+The suite runs 28 tests: 15 rail tests plus the 13 Phase 1 regressions. It uses actual FastAPI handlers and real MySQL, creates a unique disposable schema, loads the actual feature SQL, and deletes only that schema. It never starts the application's automatic migration/seed hooks. Existing databases and running services were not changed. Final pass/fail result is recorded in the completion entry below.
+
+Rail coverage: single allocation and duplicate retry; three-trip fractional-space spillover; complete shortage rollback across multiple products; two concurrent requests for one order; two orders competing for the same capacity; stale repeatable-read capacity and quantity guards; order-route versus customer-profile-route conflict; selected-trip empty/invalid/cutoff failures; exact time/decimal validation; allowed hubs; Logistics Manager success/customer mutation denial; capacity shrink/cancel rejection; received-manifest exclusion; reversal releases capacity; generated migration applied twice without allocation loss and with one missing future manifest restored.
+
+The real receipt integration simulates arrival, receives every spillover leg through the existing inventory API/procedure, checks stock totals and rejection of duplicate receipt, and confirms order status advances only after the final leg. No external notifications were sent. Python compilation passed. Preliminary test-harness assertions, the real stale-read/manifest defects, and one generated migration SQL ambiguity were fixed before final verification.
+
+### Remaining dependencies / approval
+
+Browser interaction remains blocked (no connected browser). Production-domain/cookie/deployment checks from Phase 1 still apply. Historical allocations missing manifests require explicit inventory reconciliation; the migration does not synthesize historical receipts. Empty or premature receipt policy belongs to the station member and remains to be verified. The rail tests do not certify truck dispatch, delivery completion or business reporting; those members' features were not redesigned.
+
+Ready for Phase 2 code review after the final passing suite, with the SQL/backend/frontend changes reviewed together. This is not full-lifecycle or deployment approval.
+
+Phase 2 completion result: **28/28 passed** in the final complete run (15 rail tests + 13 identity regressions), including migration repeatability/backfill and allocation-to-inventory receipt. The generated disposable schema was cleaned up. Migration consistency and all repository diff checks passed. No existing database, main branch, push or merge was changed.

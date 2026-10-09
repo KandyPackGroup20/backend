@@ -424,8 +424,14 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                 raise HTTPException(status_code=422, detail={"error_code": "ORDER_DESTINATION_REQUIRED", "message": "Provide a recipient name, phone and delivery address."})
 
             # 2. Dates
-            order_date = datetime.datetime.now(ZoneInfo("Asia/Colombo")).date()
-            delivery_date = order_date + datetime.timedelta(days=2)
+            order_date = datetime.date.today()
+            if payload.booking_date:
+                try:
+                    delivery_date = datetime.date.fromisoformat(payload.booking_date)
+                except Exception:
+                    delivery_date = order_date + datetime.timedelta(days=7)
+            else:
+                delivery_date = order_date + datetime.timedelta(days=7)
 
             # 3. Insert customer_order
             cursor.execute(
@@ -452,14 +458,14 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                 for item in payload.items:
                     prod = prod_map.get(item.product_id)
                     if prod:
-                        unit_p = float(prod.get("unit_price", 0.0))
+                        unit_price = float(prod.get("unit_price", 0.0))
                         try:
                             cursor.execute(
                                 """
                                 INSERT INTO order_item (order_id, product_id, quantity, unit_price_at_order)
                                 VALUES (%s, %s, %s, %s)
                                 """,
-                                (order_id, item.product_id, item.quantity, unit_p)
+                                (order_id, item.product_id, item.quantity, unit_price)
                             )
                         except Exception:
                             cursor.execute(
@@ -471,7 +477,7 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                             )
                         item_weight = float(prod["unit_weight_kg"]) * item.quantity
                         item_space = float(prod["space_consumption_rate"]) * item.quantity
-                        item_price = float(prod["unit_price"]) * item.quantity
+                        item_price = unit_price * item.quantity
 
                         total_weight_kg += item_weight
                         total_space_units += item_space
@@ -482,15 +488,15 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                 cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
                 prod = cursor.fetchone()
                 product_id = prod["product_id"] if prod else 1
+                fallback_price = float(prod["unit_price"]) if prod else 3200.0
                 qty = max(1, int((payload.weight_kg or 25) / 2))
-                unit_p = float(prod["unit_price"]) if prod else 3200.0
                 try:
                     cursor.execute(
                         """
                         INSERT INTO order_item (order_id, product_id, quantity, unit_price_at_order)
                         VALUES (%s, %s, %s, %s)
                         """,
-                        (order_id, product_id, qty, unit_p)
+                        (order_id, product_id, qty, fallback_price)
                     )
                 except Exception:
                     cursor.execute(
@@ -502,7 +508,7 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                     )
                 total_weight_kg = float(payload.weight_kg or 25.0)
                 total_space_units = float(prod["space_consumption_rate"]) * qty if prod else 0.5
-                total_goods_amount = float(prod["unit_price"]) * qty if prod else 3200.0
+                total_goods_amount = fallback_price * qty
                 item_summaries.append(f"{payload.cargo_description or 'Ceylon Tea & Spices'} ({total_weight_kg}kg)")
 
             # 5. Insert order_status_history

@@ -104,17 +104,43 @@ def get_trip_capacity(
     destination_station_id: Optional[int] = None,
     current_user: dict = Depends(require_roles(RAIL_ROLES)),
 ):
-    # Uses the v_trip_capacity_usage view (Feature 4.2)
+    # Uses the v_trip_capacity_usage view (Feature 4.2) with direct SQL fallback
+    query_view = '''
+        SELECT trip_id, origin_station_id, destination_station_id,
+               departure_datetime, status, total_capacity,
+               used_space, remaining_space, utilisation_pct
+        FROM v_trip_capacity_usage
+        WHERE (%s IS NULL OR destination_station_id = %s)
+        ORDER BY departure_datetime
+    '''
+    query_fallback = '''
+        SELECT tt.trip_id, tt.origin_station_id, tt.destination_station_id,
+               tt.departure_datetime, tt.status, tt.total_capacity,
+               COALESCE(SUM(ra.allocated_space), 0) AS used_space,
+               tt.total_capacity - COALESCE(SUM(ra.allocated_space), 0) AS remaining_space,
+               ROUND((COALESCE(SUM(ra.allocated_space), 0) / tt.total_capacity) * 100, 2) AS utilisation_pct
+        FROM train_trip tt
+        LEFT JOIN rail_allocation ra ON tt.trip_id = ra.trip_id
+        WHERE (%s IS NULL OR tt.destination_station_id = %s)
+        GROUP BY tt.trip_id, tt.origin_station_id, tt.destination_station_id, tt.departure_datetime, tt.status, tt.total_capacity
+        ORDER BY tt.departure_datetime
+    '''
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute('''
-                SELECT trip_id, origin_station_id, destination_station_id,
-                       departure_datetime, status, total_capacity,
-                       used_space, remaining_space, utilisation_pct
-                FROM v_trip_capacity_usage
-                WHERE (%s IS NULL OR destination_station_id = %s)
-                ORDER BY departure_datetime
-            ''', (destination_station_id, destination_station_id))
+            try:
+                cursor.execute(query_view, (destination_station_id, destination_station_id))
+            except Exception as e:
+                err_code = getattr(e, "args", [None])[0]
+                if err_code in (1054, 1146):
+                    try:
+                        from app.core.migrations import run_migrations
+                        run_migrations()
+                        cursor.execute(query_view, (destination_station_id, destination_station_id))
+                    except Exception:
+                        cursor.execute(query_fallback, (destination_station_id, destination_station_id))
+                else:
+                    raise
+
             trips = cursor.fetchall()
             for t in trips:
                 if t.get('departure_datetime'):
@@ -129,23 +155,53 @@ def get_train_schedules(response: Response):
         response.headers["X-Cache"] = "HIT"
         return cached
 
+    query_view = '''
+        SELECT tt.trip_id,
+               ss1.city AS origin_city,
+               ss2.city AS destination_city,
+               tt.departure_datetime,
+               tt.arrival_datetime,
+               tt.total_capacity,
+               v.remaining_space AS remaining_capacity,
+               tt.status
+        FROM train_trip tt
+        JOIN station_store ss1 ON tt.origin_station_id = ss1.station_id
+        JOIN station_store ss2 ON tt.destination_station_id = ss2.station_id
+        JOIN v_trip_capacity_usage v ON v.trip_id = tt.trip_id
+        ORDER BY tt.departure_datetime ASC
+    '''
+    query_fallback = '''
+        SELECT tt.trip_id,
+               ss1.city AS origin_city,
+               ss2.city AS destination_city,
+               tt.departure_datetime,
+               tt.arrival_datetime,
+               tt.total_capacity,
+               (tt.total_capacity - COALESCE(SUM(ra.allocated_space), 0)) AS remaining_capacity,
+               tt.status
+        FROM train_trip tt
+        JOIN station_store ss1 ON tt.origin_station_id = ss1.station_id
+        JOIN station_store ss2 ON tt.destination_station_id = ss2.station_id
+        LEFT JOIN rail_allocation ra ON tt.trip_id = ra.trip_id
+        GROUP BY tt.trip_id, ss1.city, ss2.city, tt.departure_datetime, tt.arrival_datetime, tt.total_capacity, tt.status
+        ORDER BY tt.departure_datetime ASC
+    '''
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute('''
-                SELECT tt.trip_id,
-                       ss1.city AS origin_city,
-                       ss2.city AS destination_city,
-                       tt.departure_datetime,
-                       tt.arrival_datetime,
-                       tt.total_capacity,
-                       v.remaining_space AS remaining_capacity,
-                       tt.status
-                FROM train_trip tt
-                JOIN station_store ss1 ON tt.origin_station_id = ss1.station_id
-                JOIN station_store ss2 ON tt.destination_station_id = ss2.station_id
-                JOIN v_trip_capacity_usage v ON v.trip_id = tt.trip_id
-                ORDER BY tt.departure_datetime ASC
-            ''')
+            try:
+                cursor.execute(query_view)
+            except Exception as e:
+                err_code = getattr(e, "args", [None])[0]
+                if err_code in (1054, 1146):
+                    try:
+                        from app.core.migrations import run_migrations
+                        run_migrations()
+                        cursor.execute(query_view)
+                    except Exception:
+                        cursor.execute(query_fallback)
+                else:
+                    raise
+
             trips = cursor.fetchall()
             for trip in trips:
                 if trip.get('departure_datetime'):

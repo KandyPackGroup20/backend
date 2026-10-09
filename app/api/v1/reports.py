@@ -10,24 +10,75 @@ router = APIRouter(
     dependencies=[Depends(require_roles(REPORT_ROLES))],
 )
 
+def _execute_report_query(cursor, primary_query: str, fallback_query: str = None):
+    """Executes a report SQL query with auto-migration recovery and fallback schema support."""
+    try:
+        cursor.execute(primary_query)
+    except Exception as e:
+        err_code = getattr(e, "args", [None])[0]
+        if err_code in (1054, 1146):
+            try:
+                from app.core.migrations import run_migrations
+                run_migrations()
+                cursor.execute(primary_query)
+                return
+            except Exception:
+                if fallback_query:
+                    cursor.execute(fallback_query)
+                    return
+        raise
+
 @router.get("/analytics")
 def get_rail_analytics():
-    # Queries v_quarterly_rail_analytics database view
+    # Queries v_quarterly_rail_analytics database view with fallback
+    query_primary = "SELECT * FROM v_quarterly_rail_analytics"
+    query_fallback = """
+        SELECT 
+            ss.city AS destination_hub,
+            YEAR(co.order_date) AS order_year,
+            QUARTER(co.order_date) AS order_quarter,
+            COUNT(DISTINCT co.order_id) AS total_orders,
+            SUM(ra.allocated_quantity) AS total_units_shipped,
+            SUM(ra.allocated_space) AS total_cubic_meters_shipped
+        FROM customer_order co
+        JOIN customer c ON co.customer_id = c.customer_id
+        LEFT JOIN delivery_route dr ON c.route_id = dr.route_id
+        LEFT JOIN station_store ss ON dr.station_id = ss.station_id
+        JOIN order_item oi ON co.order_id = oi.order_id
+        JOIN rail_allocation ra ON oi.order_item_id = ra.order_item_id
+        GROUP BY ss.city, YEAR(co.order_date), QUARTER(co.order_date);
+    """
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM v_quarterly_rail_analytics")
+            _execute_report_query(cursor, query_primary, query_fallback)
             data = cursor.fetchall()
             return {"analytics": data}
 
 @router.get("/driver-caps")
 def get_driver_cap_warnings():
     # Queries v_drivers_near_cap database view for SR-5.2.4 visual warnings
+    query_primary = "SELECT * FROM v_drivers_near_cap"
+    query_fallback = """
+        SELECT 
+            ds.delivery_staff_id AS driver_id,
+            u.name AS full_name,
+            ds.work_hours AS accumulated_weekly_hours,
+            40.00 AS cap_hours,
+            ROUND((ds.work_hours / 40.00) * 100, 1) AS utilization_pct,
+            CASE 
+                WHEN ds.work_hours >= 40.00 THEN 'CAP_REACHED'
+                WHEN ds.work_hours >= 36.00 THEN 'WARNING_NEAR_CAP'
+                ELSE 'SAFE'
+            END AS status_flag
+        FROM delivery_staff ds
+        JOIN user u ON ds.user_id = u.user_id
+        WHERE u.role = 'DRIVER';
+    """
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM v_drivers_near_cap")
+            _execute_report_query(cursor, query_primary, query_fallback)
             data = cursor.fetchall()
             return {"driver_cap_warnings": data}
-
 @router.get("/audit-logs")
 def get_roster_audit_logs():
     # Fetches immutable roster audit log entries for audit inspections
@@ -46,23 +97,6 @@ def get_roster_audit_logs():
                     log['attempt_timestamp'] = log['attempt_timestamp'].strftime("%Y-%m-%d %H:%M:%S")
             return {"audit_logs": logs}
 
-def _execute_report_query(cursor, primary_query: str, fallback_query: str = None):
-    """Executes a report SQL query with auto-migration recovery and fallback schema support."""
-    try:
-        cursor.execute(primary_query)
-    except Exception as e:
-        err_code = getattr(e, "args", [None])[0]
-        if err_code in (1054, 1146):
-            try:
-                from app.core.migrations import run_migrations
-                run_migrations()
-                cursor.execute(primary_query)
-                return
-            except Exception:
-                if fallback_query:
-                    cursor.execute(fallback_query)
-                    return
-        raise
 
 @router.get("/quarterly-sales")
 def get_quarterly_sales():

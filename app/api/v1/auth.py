@@ -75,6 +75,8 @@ class ProfileUpdateRequest(BaseModel):
     
 # 1. Login Endpoint (Strictly Parameterized / SQLi Protected)
     
+@router.post("", response_model=LoginResponse, include_in_schema=False)
+@router.post("/", response_model=LoginResponse, include_in_schema=False)
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, response: Response):
     # rate limit check

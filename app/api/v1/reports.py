@@ -46,133 +46,253 @@ def get_roster_audit_logs():
                     log['attempt_timestamp'] = log['attempt_timestamp'].strftime("%Y-%m-%d %H:%M:%S")
             return {"audit_logs": logs}
 
+def _execute_report_query(cursor, primary_query: str, fallback_query: str = None):
+    """Executes a report SQL query with auto-migration recovery and fallback schema support."""
+    try:
+        cursor.execute(primary_query)
+    except Exception as e:
+        err_code = getattr(e, "args", [None])[0]
+        if err_code in (1054, 1146):
+            try:
+                from app.core.migrations import run_migrations
+                run_migrations()
+                cursor.execute(primary_query)
+                return
+            except Exception:
+                if fallback_query:
+                    cursor.execute(fallback_query)
+                    return
+        raise
+
 @router.get("/quarterly-sales")
 def get_quarterly_sales():
+    query_primary = """
+        SELECT
+            YEAR(co.order_date) AS sales_year,
+            QUARTER(co.order_date) AS sales_quarter,
+            dr.route_name,
+            p.product_name,
+            SUM(oi.quantity) AS total_quantity,
+            ROUND(
+                SUM(oi.quantity * oi.unit_price_at_order),
+                2
+            ) AS total_sales
+        FROM customer_order co
+        JOIN customer c
+            ON co.customer_id = c.customer_id
+        LEFT JOIN delivery_route dr
+            ON c.route_id = dr.route_id
+        JOIN order_item oi
+            ON co.order_id = oi.order_id
+        JOIN product p
+            ON oi.product_id = p.product_id
+        GROUP BY
+            YEAR(co.order_date),
+            QUARTER(co.order_date),
+            dr.route_name,
+            p.product_name
+        ORDER BY
+            sales_year,
+            sales_quarter,
+            dr.route_name,
+            p.product_name
+    """
+    query_fallback = """
+        SELECT
+            YEAR(co.order_date) AS sales_year,
+            QUARTER(co.order_date) AS sales_quarter,
+            dr.route_name,
+            p.product_name,
+            SUM(oi.quantity) AS total_quantity,
+            ROUND(
+                SUM(oi.quantity * p.unit_price),
+                2
+            ) AS total_sales
+        FROM customer_order co
+        JOIN customer c
+            ON co.customer_id = c.customer_id
+        LEFT JOIN delivery_route dr
+            ON c.route_id = dr.route_id
+        JOIN order_item oi
+            ON co.order_id = oi.order_id
+        JOIN product p
+            ON oi.product_id = p.product_id
+        GROUP BY
+            YEAR(co.order_date),
+            QUARTER(co.order_date),
+            dr.route_name,
+            p.product_name
+        ORDER BY
+            sales_year,
+            sales_quarter,
+            dr.route_name,
+            p.product_name
+    """
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT
-                    YEAR(co.order_date) AS sales_year,
-                    QUARTER(co.order_date) AS sales_quarter,
-                    dr.route_name,
-                    p.product_name,
-                    SUM(oi.quantity) AS total_quantity,
-                    ROUND(
-                        SUM(oi.quantity * oi.unit_price_at_order),
-                        2
-                    ) AS total_sales
-                FROM customer_order co
-                JOIN customer c
-                    ON co.customer_id = c.customer_id
-                LEFT JOIN delivery_route dr
-                    ON c.route_id = dr.route_id
-                JOIN order_item oi
-                    ON co.order_id = oi.order_id
-                JOIN product p
-                    ON oi.product_id = p.product_id
-                GROUP BY
-                    YEAR(co.order_date),
-                    QUARTER(co.order_date),
-                    dr.route_name,
-                    p.product_name
-                ORDER BY
-                    sales_year,
-                    sales_quarter,
-                    dr.route_name,
-                    p.product_name
-            """)
-
+            _execute_report_query(cursor, query_primary, query_fallback)
             data = cursor.fetchall()
-
             return {"quarterly_sales": data}
 
         
 @router.get("/top-products")
 def get_top_products():
+    query_primary = """
+        WITH quarterly_product_sales AS (
+            SELECT
+                YEAR(co.order_date) AS sales_year,
+                QUARTER(co.order_date) AS sales_quarter,
+                p.product_id,
+                p.product_name,
+                SUM(oi.quantity) AS total_quantity,
+                ROUND(
+                    SUM(oi.quantity * oi.unit_price_at_order),
+                    2
+                ) AS total_sales
+            FROM customer_order co
+            JOIN order_item oi
+                ON co.order_id = oi.order_id
+            JOIN product p
+                ON oi.product_id = p.product_id
+            GROUP BY
+                YEAR(co.order_date),
+                QUARTER(co.order_date),
+                p.product_id,
+                p.product_name
+        ),
+        ranked_products AS (
+            SELECT
+                *,
+                DENSE_RANK() OVER (
+                    PARTITION BY sales_year, sales_quarter
+                    ORDER BY total_quantity DESC
+                ) AS product_rank
+            FROM quarterly_product_sales
+        )
+        SELECT
+            sales_year,
+            sales_quarter,
+            product_id,
+            product_name,
+            total_quantity,
+            total_sales,
+            product_rank
+        FROM ranked_products
+        WHERE product_rank = 1
+        ORDER BY
+            sales_year,
+            sales_quarter
+    """
+    query_fallback = """
+        WITH quarterly_product_sales AS (
+            SELECT
+                YEAR(co.order_date) AS sales_year,
+                QUARTER(co.order_date) AS sales_quarter,
+                p.product_id,
+                p.product_name,
+                SUM(oi.quantity) AS total_quantity,
+                ROUND(
+                    SUM(oi.quantity * p.unit_price),
+                    2
+                ) AS total_sales
+            FROM customer_order co
+            JOIN order_item oi
+                ON co.order_id = oi.order_id
+            JOIN product p
+                ON oi.product_id = p.product_id
+            GROUP BY
+                YEAR(co.order_date),
+                QUARTER(co.order_date),
+                p.product_id,
+                p.product_name
+        ),
+        ranked_products AS (
+            SELECT
+                *,
+                DENSE_RANK() OVER (
+                    PARTITION BY sales_year, sales_quarter
+                    ORDER BY total_quantity DESC
+                ) AS product_rank
+            FROM quarterly_product_sales
+        )
+        SELECT
+            sales_year,
+            sales_quarter,
+            product_id,
+            product_name,
+            total_quantity,
+            total_sales,
+            product_rank
+        FROM ranked_products
+        WHERE product_rank = 1
+        ORDER BY
+            sales_year,
+            sales_quarter
+    """
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                WITH quarterly_product_sales AS (
-                    SELECT
-                        YEAR(co.order_date) AS sales_year,
-                        QUARTER(co.order_date) AS sales_quarter,
-                        p.product_id,
-                        p.product_name,
-                        SUM(oi.quantity) AS total_quantity,
-                        ROUND(
-                            SUM(oi.quantity * oi.unit_price_at_order),
-                            2
-                        ) AS total_sales
-                    FROM customer_order co
-                    JOIN order_item oi
-                        ON co.order_id = oi.order_id
-                    JOIN product p
-                        ON oi.product_id = p.product_id
-                    GROUP BY
-                        YEAR(co.order_date),
-                        QUARTER(co.order_date),
-                        p.product_id,
-                        p.product_name
-                ),
-                ranked_products AS (
-                    SELECT
-                        *,
-                        DENSE_RANK() OVER (
-                            PARTITION BY sales_year, sales_quarter
-                            ORDER BY total_quantity DESC
-                        ) AS product_rank
-                    FROM quarterly_product_sales
-                )
-                SELECT
-                    sales_year,
-                    sales_quarter,
-                    product_id,
-                    product_name,
-                    total_quantity,
-                    total_sales,
-                    product_rank
-                FROM ranked_products
-                WHERE product_rank = 1
-                ORDER BY
-                    sales_year,
-                    sales_quarter
-            """)
-
+            _execute_report_query(cursor, query_primary, query_fallback)
             data = cursor.fetchall()
-
             return {"top_products": data}
 
 
 @router.get("/city-route-sales")
 def get_city_route_sales():
+    query_primary = """
+        SELECT
+            ss.city AS city_name,
+            dr.route_name,
+            SUM(oi.quantity) AS total_quantity,
+            ROUND(
+                SUM(oi.quantity * oi.unit_price_at_order),
+                2
+            ) AS total_sales
+        FROM customer_order co
+        JOIN customer c
+            ON co.customer_id = c.customer_id
+        JOIN delivery_route dr
+            ON c.route_id = dr.route_id
+        JOIN station_store ss
+            ON dr.station_id = ss.station_id
+        JOIN order_item oi
+            ON co.order_id = oi.order_id
+        GROUP BY
+            ss.city,
+            dr.route_name
+        ORDER BY
+            ss.city,
+            dr.route_name
+    """
+    query_fallback = """
+        SELECT
+            ss.city AS city_name,
+            dr.route_name,
+            SUM(oi.quantity) AS total_quantity,
+            ROUND(
+                SUM(oi.quantity * p.unit_price),
+                2
+            ) AS total_sales
+        FROM customer_order co
+        JOIN customer c
+            ON co.customer_id = c.customer_id
+        JOIN delivery_route dr
+            ON c.route_id = dr.route_id
+        JOIN station_store ss
+            ON dr.station_id = ss.station_id
+        JOIN order_item oi
+            ON co.order_id = oi.order_id
+        JOIN product p
+            ON oi.product_id = p.product_id
+        GROUP BY
+            ss.city,
+            dr.route_name
+        ORDER BY
+            ss.city,
+            dr.route_name
+    """
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT
-                    ss.city AS city_name,
-                    dr.route_name,
-                    SUM(oi.quantity) AS total_quantity,
-                    ROUND(
-                        SUM(oi.quantity * oi.unit_price_at_order),
-                        2
-                    ) AS total_sales
-                FROM customer_order co
-                JOIN customer c
-                    ON co.customer_id = c.customer_id
-                JOIN delivery_route dr
-                    ON c.route_id = dr.route_id
-                JOIN station_store ss
-                    ON dr.station_id = ss.station_id
-                JOIN order_item oi
-                    ON co.order_id = oi.order_id
-                GROUP BY
-                    ss.city,
-                    dr.route_name
-                ORDER BY
-                    ss.city,
-                    dr.route_name
-            """)
-
+            _execute_report_query(cursor, query_primary, query_fallback)
             data = cursor.fetchall()
             return {"city_route_sales": data}
 
@@ -360,10 +480,8 @@ def get_truck_utilisation():
 
 @router.get("/station-inventory")
 def get_station_inventory_report():
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                WITH inventory_summary AS (
+    query = """
+        WITH inventory_summary AS (
                     SELECT
                         m.station_id,
                         oi.product_id,
@@ -450,8 +568,9 @@ def get_station_inventory_report():
                 ORDER BY
                     ss.city,
                     p.product_name
-            """)
-
+    """
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            _execute_report_query(cursor, query)
             data = cursor.fetchall()
-
             return {"station_inventory": data}

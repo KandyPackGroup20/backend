@@ -4,10 +4,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.v1 import auth, rail, roster, reports, notifications, orders
 from app.core.notifications import ensure_notification_table
+from app.core.migrations import run_migrations
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure critical tables exist upon startup (Render cloud DB / local)
+    # Ensure all tables and columns exist upon startup (Render cloud DB / local)
+    try:
+        run_migrations()
+    except Exception as e:
+        print(f"[STARTUP DB MIGRATION WARNING] Failed to run migrations on startup: {e}")
     try:
         ensure_notification_table()
     except Exception as e:

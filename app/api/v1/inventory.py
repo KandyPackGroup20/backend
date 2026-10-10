@@ -72,6 +72,7 @@ def _serialize_datetimes(row: dict, fields: list[str]) -> dict:
 
 # ---------- Endpoints ----------
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 def get_station_inventory(
     station_id: Optional[int] = Query(None, description="Filter to one station; omit for all stations"),

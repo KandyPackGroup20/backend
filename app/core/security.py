@@ -93,11 +93,22 @@ def get_current_user(request: Request) -> dict:
     return user
 
 
+def is_allowed_origin(origin: Optional[str]) -> bool:
+    if not origin:
+        return True
+    if origin in settings.AUTH_ALLOWED_ORIGINS:
+        return True
+    parsed = urlsplit(origin)
+    host = (parsed.hostname or "").lower()
+    if host.endswith(".vercel.app") or host == "localhost" or host.endswith(".localhost"):
+        return True
+    return False
+
 def request_portal(request: Request) -> str:
     """Use an allowlisted browser origin, never a client-supplied role/portal claim."""
     origin = request.headers.get("origin")
     if origin:
-        if origin not in settings.AUTH_ALLOWED_ORIGINS:
+        if not is_allowed_origin(origin):
             raise HTTPException(status_code=403, detail="ORIGIN_NOT_ALLOWED")
         hostname = urlsplit(origin).hostname or ""
     else:

@@ -30,10 +30,13 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from app.core.security import is_allowed_origin
+
 # CORS setup for dual frontends (Customer & Admin)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.AUTH_ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,7 +46,7 @@ app.add_middleware(
 async def check_browser_origin(request: Request, call_next):
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("origin")
-        if origin and origin not in settings.AUTH_ALLOWED_ORIGINS:
+        if origin and not is_allowed_origin(origin):
             return JSONResponse(status_code=403, content={"detail": "ORIGIN_NOT_ALLOWED"})
         if request.cookies.get("kandypack_session") and not origin and request.headers.get("sec-fetch-site") == "cross-site":
             return JSONResponse(status_code=403, content={"detail": "ORIGIN_NOT_ALLOWED"})

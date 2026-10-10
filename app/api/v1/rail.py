@@ -198,6 +198,16 @@ def create_train_trip(
                 )
                 trip_id = cursor.lastrowid
 
+                # Ensure pending manifest exists for this scheduled train trip at destination station
+                cursor.execute(
+                    """
+                    INSERT INTO manifest (station_id, trip_id, status)
+                    VALUES (%s, %s, 'PENDING')
+                    ON DUPLICATE KEY UPDATE manifest_id = manifest_id
+                    """,
+                    (payload.destination_station_id, trip_id)
+                )
+
                 # Audit log entry
                 cursor.execute(
                     """
@@ -726,7 +736,7 @@ def _allocate_rail_capacity(payload: RailAllocateRequest, current_user: dict):
                 FROM customer_order co
                 JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
                 JOIN station_store ss ON dr.station_id = ss.station_id
-                LEFT JOIN user u ON (u.user_id = ss.manager_id OR (u.role = 'STORE_MGR' AND u.email LIKE CONCAT('%', LOWER(ss.city), '%')))
+                LEFT JOIN user u ON (u.user_id = ss.manager_id OR (u.role = 'STORE_MGR' AND u.email LIKE CONCAT('%%', LOWER(ss.city), '%%')))
                 WHERE co.order_id = %s
                 ORDER BY u.user_id DESC
                 LIMIT 1

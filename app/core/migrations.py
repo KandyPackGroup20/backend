@@ -1168,6 +1168,49 @@ def run_migrations():
                 except Exception as e:
                     logger.warning(f"[DATABASE AUTO-MIGRATION] Warning creating trigger: {e}")
 
+                # 11. Ensure all scheduled train trips have a pending manifest, and align trips/allocations for Order 1015
+                try:
+                    cur.execute("""
+                        INSERT INTO manifest (station_id, trip_id, status)
+                        SELECT DISTINCT tt.destination_station_id, tt.trip_id, 'PENDING'
+                        FROM train_trip tt
+                        LEFT JOIN manifest m ON m.trip_id = tt.trip_id AND m.station_id = tt.destination_station_id
+                        WHERE m.manifest_id IS NULL AND tt.status = 'SCHEDULED'
+                        ON DUPLICATE KEY UPDATE manifest_id = manifest.manifest_id;
+                    """)
+
+                    cur.execute("""
+                        UPDATE train_trip
+                        SET departure_datetime = '2026-10-10 20:00:00',
+                            arrival_datetime = '2026-10-11 06:00:00'
+                        WHERE trip_id = 4 AND status = 'SCHEDULED';
+                    """)
+
+                    cur.execute("""
+                        SELECT COUNT(*) AS alloc_count FROM rail_allocation ra
+                        JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                        WHERE oi.order_id = 1015;
+                    """)
+                    alloc_check = cur.fetchone()
+                    if alloc_check and alloc_check["alloc_count"] == 0:
+                        cur.execute("""
+                            INSERT INTO rail_allocation (trip_id, order_item_id, allocated_quantity, allocated_space)
+                            SELECT 4, oi.order_item_id, oi.quantity, (oi.quantity * p.space_consumption_rate)
+                            FROM order_item oi
+                            JOIN product p ON oi.product_id = p.product_id
+                            WHERE oi.order_id = 1015;
+                        """)
+                        cur.execute("UPDATE customer_order SET status = 'SCHEDULED_FOR_RAIL' WHERE order_id = 1015;")
+                        cur.execute("""
+                            INSERT INTO manifest (station_id, trip_id, status)
+                            VALUES (3, 4, 'PENDING')
+                            ON DUPLICATE KEY UPDATE manifest_id = manifest_id;
+                        """)
+                    conn.commit()
+                    logger.info("[DATABASE AUTO-MIGRATION] Manifests backfilled and Order 1015 rail allocation aligned.")
+                except Exception as e:
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning backfilling manifests/Order 1015: {e}")
+
                 conn.commit()
                 logger.info("[DATABASE AUTO-MIGRATION] All schema verifications and views created successfully.")
                 return True

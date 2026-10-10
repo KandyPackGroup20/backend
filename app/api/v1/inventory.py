@@ -35,6 +35,33 @@ class StationAuthRequest(BaseModel):
 
 # ---------- Helpers ----------
 
+def _get_user_assigned_station_id(current_user: dict, conn) -> Optional[int]:
+    """Resolves the station ID assigned to a STORE_MGR or WAREHOUSE_STAFF."""
+    if current_user.get("role") not in ["STORE_MGR", "WAREHOUSE_STAFF"]:
+        return None
+
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT station_id FROM station_store WHERE manager_id = %s", (current_user["user_id"],))
+        row = cursor.fetchone()
+        if row and row.get("station_id"):
+            return row["station_id"]
+
+    email = (current_user.get("email") or "").lower()
+    city_map = {
+        "colombo": 1,
+        "negombo": 2,
+        "galle": 3,
+        "matara": 4,
+        "jaffna": 5,
+        "trinco": 6,
+        "kandy": 7,
+    }
+    for city, sid in city_map.items():
+        if city in email:
+            return sid
+    return None
+
+
 def _serialize_datetimes(row: dict, fields: list[str]) -> dict:
     """Converts any datetime columns in a row to plain strings so FastAPI can return them as JSON."""
     for f in fields:
@@ -52,11 +79,13 @@ def get_station_inventory(
 ):
     """Feature 4.4: live stock levels per station/product (v_station_inventory)."""
     with get_db() as conn:
+        assigned_station_id = _get_user_assigned_station_id(current_user, conn)
+        target_station_id = assigned_station_id if assigned_station_id is not None else station_id
         with conn.cursor() as cursor:
-            if station_id is not None:
+            if target_station_id is not None:
                 cursor.execute(
                     "SELECT * FROM v_station_inventory WHERE station_id = %s ORDER BY product_id",
-                    (station_id,)
+                    (target_station_id,)
                 )
             else:
                 cursor.execute("SELECT * FROM v_station_inventory ORDER BY station_id, product_id")
@@ -73,17 +102,20 @@ def get_incoming_manifests(
     current_user: dict = Depends(require_roles(["STORE_MGR", "SUPERADMIN"]))
 ):
     """Feature 4.4: train arrivals waiting to be (or already) processed at a station."""
-    query = "SELECT * FROM v_incoming_train_manifests WHERE 1=1"
-    params = []
-    if station_id is not None:
-        query += " AND station_id = %s"
-        params.append(station_id)
-    if status is not None:
-        query += " AND manifest_status = %s"
-        params.append(status)
-    query += " ORDER BY departure_datetime"
-
     with get_db() as conn:
+        assigned_station_id = _get_user_assigned_station_id(current_user, conn)
+        effective_station_id = assigned_station_id if assigned_station_id is not None else station_id
+
+        query = "SELECT * FROM v_incoming_train_manifests WHERE 1=1"
+        params = []
+        if effective_station_id is not None:
+            query += " AND station_id = %s"
+            params.append(effective_station_id)
+        if status is not None:
+            query += " AND manifest_status = %s"
+            params.append(status)
+        query += " ORDER BY departure_datetime"
+
         with conn.cursor() as cursor:
             cursor.execute(query, tuple(params))
             rows = cursor.fetchall()
@@ -99,7 +131,16 @@ def get_manifest_cargo_items(
 ):
     """Feature 4.4: Inspect allocated cargo items arriving on a train trip before receiving."""
     with get_db() as conn:
+        assigned_station_id = _get_user_assigned_station_id(current_user, conn)
         with conn.cursor() as cursor:
+            if assigned_station_id is not None:
+                cursor.execute(
+                    "SELECT 1 FROM manifest WHERE trip_id = %s AND station_id = %s",
+                    (trip_id, assigned_station_id)
+                )
+                if not cursor.fetchone():
+                    raise HTTPException(status_code=403, detail="FORBIDDEN_STATION: Trip manifest does not arrive at your assigned station.")
+
             cursor.execute(
                 "SELECT * FROM v_trip_manifest_items WHERE trip_id = %s ORDER BY product_id",
                 (trip_id,)
@@ -115,10 +156,12 @@ def get_station_bins(
 ):
     """Feature 4.4 / FR-4.4.6: List bin storage locations available at a station store."""
     with get_db() as conn:
+        assigned_station_id = _get_user_assigned_station_id(current_user, conn)
+        target_station_id = assigned_station_id if assigned_station_id is not None else station_id
         with conn.cursor() as cursor:
             cursor.execute(
                 "SELECT location_id, station_id, location_code, location_type FROM storage_location WHERE station_id = %s ORDER BY location_code",
-                (station_id,)
+                (target_station_id,)
             )
             rows = cursor.fetchall()
             return {"bins": rows}
@@ -167,6 +210,10 @@ def receive_manifest(
     """Feature 4.4: Store Manager confirms a train has arrived, calling sp_receive_manifest.
     Locks the manifest row, adds stock, and advances the related order(s)."""
     with get_db() as conn:
+        assigned_station_id = _get_user_assigned_station_id(current_user, conn)
+        if assigned_station_id is not None and payload.station_id != assigned_station_id:
+            raise HTTPException(status_code=403, detail="FORBIDDEN_STATION: You can only receive manifests for your assigned station.")
+
         with conn.cursor() as cursor:
             cursor.execute(
                 "CALL sp_receive_manifest(%s, %s, %s, @result_code);",
@@ -280,6 +327,8 @@ def get_inventory_summary_report(
 ):
     """Feature 4.4 / Report 6: Station Inventory & Adjustment Summary Report."""
     with get_db() as conn:
+        assigned_station_id = _get_user_assigned_station_id(current_user, conn)
+        target_station_id = assigned_station_id if assigned_station_id is not None else station_id
         with conn.cursor() as cursor:
             stock_query = """
                 SELECT
@@ -290,17 +339,17 @@ def get_inventory_summary_report(
                 JOIN product p ON inv.product_id = p.product_id
             """
             params = []
-            if station_id is not None:
+            if target_station_id is not None:
                 stock_query += " WHERE inv.station_id = %s"
-                params.append(station_id)
+                params.append(target_station_id)
             cursor.execute(stock_query, tuple(params))
             stock_summary = cursor.fetchone()
 
             adj_query = "SELECT * FROM v_stock_adjustment_summary WHERE 1=1"
             adj_params = []
-            if station_id is not None:
+            if target_station_id is not None:
                 adj_query += " AND station_id = %s"
-                adj_params.append(station_id)
+                adj_params.append(target_station_id)
             adj_query += " ORDER BY total_loss_value DESC"
             cursor.execute(adj_query, tuple(adj_params))
             adjustments = cursor.fetchall()

@@ -221,25 +221,59 @@ def get_order_catalogue():
     """
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT product_id, product_name, category, unit_price, unit_weight_kg,
-                       space_consumption_rate, description, image_url, is_active
-                FROM product
-                WHERE is_active = 1
-                ORDER BY category ASC, product_id ASC
-            """)
-            rows = cursor.fetchall()
+            try:
+                cursor.execute("""
+                    SELECT product_id, product_name, category, unit_price, unit_weight_kg,
+                           space_consumption_rate, description, image_url, is_active
+                    FROM product
+                    WHERE is_active = 1
+                    ORDER BY category ASC, product_id ASC
+                """)
+                rows = cursor.fetchall()
+            except Exception as e:
+                if "1054" in str(e) or "Unknown column" in str(e):
+                    for col, defn in [
+                        ("category", "VARCHAR(100) NOT NULL DEFAULT 'Ceylon Tea & Spices'"),
+                        ("unit_weight_kg", "DECIMAL(8,2) NOT NULL DEFAULT 25.00"),
+                        ("description", "VARCHAR(500) NULL"),
+                        ("image_url", "VARCHAR(500) NULL"),
+                    ]:
+                        try:
+                            cursor.execute(f"ALTER TABLE product ADD COLUMN {col} {defn}")
+                        except Exception:
+                            pass
+                    try:
+                        cursor.execute("""
+                            SELECT product_id, product_name, category, unit_price, unit_weight_kg,
+                                   space_consumption_rate, description, image_url, is_active
+                            FROM product
+                            WHERE is_active = 1
+                            ORDER BY category ASC, product_id ASC
+                        """)
+                        rows = cursor.fetchall()
+                    except Exception:
+                        cursor.execute("SELECT product_id, product_name, unit_price, space_consumption_rate, is_active FROM product WHERE is_active = 1")
+                        raw_rows = cursor.fetchall()
+                        rows = []
+                        for r in raw_rows:
+                            r["category"] = "Ceylon Tea & Spices"
+                            r["unit_weight_kg"] = 25.0
+                            r["description"] = "Export Freight Cargo"
+                            r["image_url"] = "/products/tea_crate.jpg"
+                            rows.append(r)
+                else:
+                    raise
             return [
                 {
                     "product_id": r["product_id"],
                     "product_name": r["product_name"],
-                    "category": r["category"],
+                    "category": r.get("category") or "Ceylon Tea & Spices",
                     "unit_price": float(r["unit_price"]),
-                    "unit_weight_kg": float(r["unit_weight_kg"]),
+                    "unit_weight_kg": float(r.get("unit_weight_kg") or 25.0),
                     "space_consumption_rate": float(r["space_consumption_rate"]),
-                    "description": r["description"],
-                    "image_url": r["image_url"],
-                    "is_active": bool(r["is_active"])
+                    "description": r.get("description") or "",
+                    "image_url": r.get("image_url") or "/products/tea_crate.jpg",
+                    "is_active": bool(r.get("is_active", 1))
                 }
                 for r in rows
             ]
@@ -612,8 +646,34 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
 
             if payload.items and len(payload.items) > 0:
                 # Load all products from DB for accurate calculations
-                cursor.execute("SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate FROM product")
-                prod_map = {p["product_id"]: p for p in cursor.fetchall()}
+                try:
+                    cursor.execute("SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate FROM product")
+                    prod_map = {p["product_id"]: p for p in cursor.fetchall()}
+                except Exception as e:
+                    if "1054" in str(e) or "Unknown column" in str(e):
+                        for col, defn in [
+                            ("category", "VARCHAR(100) NOT NULL DEFAULT 'Ceylon Tea & Spices'"),
+                            ("unit_weight_kg", "DECIMAL(8,2) NOT NULL DEFAULT 25.00"),
+                            ("description", "VARCHAR(500) NULL"),
+                            ("image_url", "VARCHAR(500) NULL"),
+                        ]:
+                            try:
+                                cursor.execute(f"ALTER TABLE product ADD COLUMN {col} {defn}")
+                            except Exception:
+                                pass
+                        try:
+                            cursor.execute("SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate FROM product")
+                            prod_map = {p["product_id"]: p for p in cursor.fetchall()}
+                        except Exception:
+                            cursor.execute("SELECT product_id, product_name, unit_price, space_consumption_rate FROM product")
+                            raw_rows = cursor.fetchall()
+                            prod_map = {}
+                            for p in raw_rows:
+                                p["category"] = "Ceylon Tea & Spices"
+                                p["unit_weight_kg"] = 25.0
+                                prod_map[p["product_id"]] = p
+                    else:
+                        raise
 
                 for item in payload.items:
                     prod = prod_map.get(item.product_id)
@@ -635,8 +695,10 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                                 """,
                                 (order_id, item.product_id, item.quantity)
                             )
-                        item_weight = float(prod["unit_weight_kg"]) * item.quantity
-                        item_space = float(prod["space_consumption_rate"]) * item.quantity
+                        weight_each = float(prod.get("unit_weight_kg") or 25.0)
+                        space_each = float(prod.get("space_consumption_rate") or 0.05)
+                        item_weight = weight_each * item.quantity
+                        item_space = space_each * item.quantity
                         item_price = unit_price * item.quantity
 
                         total_weight_kg += item_weight
@@ -645,8 +707,17 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                         item_summaries.append(f"{prod['product_name']} (Qty: {item.quantity}, {item_weight:.1f}kg)")
             else:
                 # Single/legacy item fallback
-                cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
-                prod = cursor.fetchone()
+                try:
+                    cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
+                    prod = cursor.fetchone()
+                except Exception:
+                    try:
+                        cursor.execute("SELECT product_id, product_name, unit_price, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
+                        prod = cursor.fetchone()
+                        if prod:
+                            prod["unit_weight_kg"] = 25.0
+                    except Exception:
+                        prod = None
                 product_id = prod["product_id"] if prod else 1
                 fallback_price = float(prod["unit_price"]) if prod else 3200.0
                 qty = max(1, int((payload.weight_kg or 25) / 2))

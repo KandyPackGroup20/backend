@@ -112,6 +112,98 @@ def run_migrations():
                     except Exception:
                         pass
 
+                # 2c. Ensure product table has category, unit_weight_kg, description, image_url, is_active
+                cur.execute("SHOW TABLES LIKE 'product'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("category", "VARCHAR(100) NOT NULL DEFAULT 'Ceylon Tea & Spices'"),
+                        ("unit_weight_kg", "DECIMAL(8,2) NOT NULL DEFAULT 25.00"),
+                        ("description", "VARCHAR(500) NULL"),
+                        ("image_url", "VARCHAR(500) NULL"),
+                        ("is_active", "TINYINT DEFAULT 1"),
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM product LIKE '{col}'")
+                            if not cur.fetchone():
+                                logger.info(f"Adding missing column '{col}' to product...")
+                                cur.execute(f"ALTER TABLE product ADD COLUMN {col} {defn}")
+                                logger.info(f"Added column '{col}' to product.")
+                        except Exception as e:
+                            logger.warning(f"Error checking/adding column {col} to product: {e}")
+
+                    # Seed catalogue items if empty
+                    try:
+                        cur.execute("SELECT COUNT(*) AS cnt FROM product")
+                        cnt = cur.fetchone()["cnt"]
+                        if cnt == 0:
+                            products_to_seed = [
+                                (1, 'Kandy Pure Ceylon BOPF Tea (25kg Crate)', 'Ceylon Tea & Spices', 4500.00, 25.00, 0.0500, 'High-grown export grade Ceylon Black BOPF tea packed in moisture-resistant foil-lined wooden crates.', '/products/tea_crate.jpg'),
+                                (2, 'Ceylon Spices & Cinnamon Sack (20kg)', 'Ceylon Tea & Spices', 3800.00, 20.00, 0.0400, 'Sun-cured Ceylon alba cinnamon sticks, premium cardamom pods, and organic cloves in heavy-duty jute sacks.', '/products/spices_sack.jpg'),
+                                (3, 'Nuwara Eliya Highland Vegetables Crate (30kg)', 'Fresh Produce & FMCG', 2600.00, 30.00, 0.0800, 'Ventilated farm-fresh crates of premium highland carrots, leeks, bell peppers, and cabbage for rapid rail transit.', '/products/produce_crates.jpg'),
+                                (4, 'Ceylon Virgin Coconut Oil Canister (20L / 18kg)', 'Fresh Produce & FMCG', 4200.00, 18.00, 0.0450, 'Cold-pressed extra-virgin coconut oil in food-grade sealed HDPE transit containers.', '/products/coconut_oil.jpg'),
+                                (5, 'Kandy Handloom Cotton Textile Bolts (25kg)', 'Garments & Textiles', 5200.00, 25.00, 0.0600, 'Protective shrink-wrapped bolts of traditional Sri Lankan batik and handloom cotton textiles for commercial retail.', '/products/textile_rolls.jpg'),
+                                (6, 'Apparel & Garment Export Cartons (20kg)', 'Garments & Textiles', 4800.00, 20.00, 0.0550, 'Triple-wall corrugated export master cartons of finished garments with security straps and barcoded tags.', '/products/garments_box.jpg'),
+                                (7, 'Traditional Brassware & Metal Crafts Crate (35kg)', 'Hardware & Industrial', 7500.00, 35.00, 0.0700, 'Handcrafted polished brass oil lamps, brassware, and cultural souvenirs cushioned in protective wooden crates.', '/products/brassware_crate.jpg'),
+                                (8, 'Precision Industrial Machinery Spares (40kg)', 'Hardware & Industrial', 8900.00, 40.00, 0.0850, 'High-grade steel gears, shafts, and mechanical components packed in shock-absorbing foam-lined transport cases.', '/products/machinery_parts.jpg'),
+                            ]
+                            for pid, pname, cat, price, weight, space, desc, img in products_to_seed:
+                                cur.execute("""
+                                    INSERT INTO product (product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate, description, image_url, is_active)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
+                                """, (pid, pname, cat, price, weight, space, desc, img))
+                        else:
+                            cur.execute("""
+                                UPDATE product SET
+                                    category = CASE 
+                                        WHEN product_id IN (1, 2) THEN 'Ceylon Tea & Spices'
+                                        WHEN product_id IN (3, 4) THEN 'Fresh Produce & FMCG'
+                                        WHEN product_id IN (5, 6) THEN 'Garments & Textiles'
+                                        WHEN product_id IN (7, 8) THEN 'Hardware & Industrial'
+                                        ELSE COALESCE(category, 'Ceylon Tea & Spices')
+                                    END,
+                                    unit_weight_kg = COALESCE(unit_weight_kg, 25.00)
+                                WHERE category IS NULL OR category = '' OR unit_weight_kg IS NULL OR unit_weight_kg = 0;
+                            """)
+                    except Exception as e:
+                        logger.warning(f"Could not backfill or seed product table: {e}")
+
+                # 2d. Ensure station_store has manager_id
+                cur.execute("SHOW TABLES LIKE 'station_store'")
+                if cur.fetchone():
+                    try:
+                        cur.execute("SHOW COLUMNS FROM station_store LIKE 'manager_id'")
+                        if not cur.fetchone():
+                            cur.execute("ALTER TABLE station_store ADD COLUMN manager_id INT NULL")
+                    except Exception:
+                        pass
+
+                # 2e. Ensure user has force_password_reset
+                cur.execute("SHOW TABLES LIKE 'user'")
+                if cur.fetchone():
+                    try:
+                        cur.execute("SHOW COLUMNS FROM user LIKE 'force_password_reset'")
+                        if not cur.fetchone():
+                            cur.execute("ALTER TABLE user ADD COLUMN force_password_reset TINYINT DEFAULT 0")
+                    except Exception:
+                        pass
+
+                # 2f. Ensure customer table has required columns
+                cur.execute("SHOW TABLES LIKE 'customer'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("route_id", "INT NULL"),
+                        ("phone", "VARCHAR(30) NULL DEFAULT '0771234567'"),
+                        ("address_line", "VARCHAR(500) NULL DEFAULT 'Delivery Address'"),
+                        ("city", "VARCHAR(100) NULL DEFAULT 'Colombo'"),
+                        ("postal_code", "VARCHAR(20) NULL DEFAULT '00100'"),
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM customer LIKE '{col}'")
+                            if not cur.fetchone():
+                                cur.execute(f"ALTER TABLE customer ADD COLUMN {col} {defn}")
+                        except Exception:
+                            pass
+
                 # 3. Ensure order_item.unit_price_at_order exists
                 cur.execute("SHOW COLUMNS FROM order_item LIKE 'unit_price_at_order'")
                 if not cur.fetchone():

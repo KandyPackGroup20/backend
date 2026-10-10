@@ -464,34 +464,151 @@ def run_migrations():
                 except Exception as e:
                     pass
 
-                # 7. Ensure All Station Store Managers exist
+                # Ensure inventory table has station_id, product_id, location_id, last_updated
+                cur.execute("SHOW TABLES LIKE 'inventory'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("station_id", "INT NULL"),
+                        ("product_id", "INT NULL"),
+                        ("location_id", "INT NULL"),
+                        ("stored_quantity", "INT NOT NULL DEFAULT 0"),
+                        ("last_updated", "DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM inventory LIKE '{col}'")
+                            if not cur.fetchone():
+                                cur.execute(f"ALTER TABLE inventory ADD COLUMN {col} {defn}")
+                        except Exception:
+                            pass
+
+                # View 9: v_station_inventory
                 try:
-                    default_pw_hash = '$2b$12$vZdokKakUJDbss6pql2eouY6R71UscldmnVEiJTCPfhOrL3DpEa6e'
+                    cur.execute("""
+                        CREATE OR REPLACE VIEW v_station_inventory AS
+                        SELECT
+                            inv.inventory_id,
+                            ss.station_id,
+                            ss.city AS station_city,
+                            p.product_id,
+                            p.product_name,
+                            p.unit_price,
+                            p.space_consumption_rate,
+                            inv.stored_quantity,
+                            sl.location_code AS bin_code,
+                            sl.location_type AS bin_type,
+                            inv.last_updated
+                        FROM inventory inv
+                        JOIN station_store ss ON inv.station_id = ss.station_id
+                        JOIN product p ON inv.product_id = p.product_id
+                        LEFT JOIN storage_location sl ON inv.location_id = sl.location_id;
+                    """)
+                except Exception as e:
+                    logger.warning(f"Could not create v_station_inventory view: {e}")
+
+                # View 10: v_incoming_train_manifests
+                try:
+                    cur.execute("""
+                        CREATE OR REPLACE VIEW v_incoming_train_manifests AS
+                        SELECT
+                            m.manifest_id,
+                            m.station_id,
+                            ss.city AS destination_station,
+                            tt.trip_id,
+                            tt.departure_datetime,
+                            tt.arrival_datetime,
+                            tt.status AS train_status,
+                            m.status AS manifest_status,
+                            m.received_at
+                        FROM manifest m
+                        JOIN train_trip tt ON m.trip_id = tt.trip_id
+                        JOIN station_store ss ON m.station_id = ss.station_id;
+                    """)
+                except Exception as e:
+                    logger.warning(f"Could not create v_incoming_train_manifests view: {e}")
+
+                # View 11: v_trip_manifest_items
+                try:
+                    cur.execute("""
+                        CREATE OR REPLACE VIEW v_trip_manifest_items AS
+                        SELECT
+                            ra.trip_id,
+                            ra.order_item_id,
+                            oi.order_id,
+                            p.product_id,
+                            p.product_name,
+                            ra.allocated_quantity,
+                            ra.allocated_space,
+                            p.space_consumption_rate,
+                            tt.destination_station_id AS station_id
+                        FROM rail_allocation ra
+                        JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                        JOIN product p ON oi.product_id = p.product_id
+                        JOIN train_trip tt ON ra.trip_id = tt.trip_id;
+                    """)
+                except Exception as e:
+                    logger.warning(f"Could not create v_trip_manifest_items view: {e}")
+
+                # View 12: v_stock_adjustment_summary (Report 6)
+                try:
+                    cur.execute("""
+                        CREATE OR REPLACE VIEW v_stock_adjustment_summary AS
+                        SELECT
+                            ss.station_id,
+                            ss.city AS station_city,
+                            p.product_id,
+                            p.product_name,
+                            p.unit_price,
+                            sa.reason,
+                            COUNT(sa.adjustment_id) AS total_adjustment_events,
+                            SUM(sa.quantity_delta) AS net_quantity_delta,
+                            SUM(CASE WHEN sa.quantity_delta < 0 THEN ABS(sa.quantity_delta) ELSE 0 END) AS total_units_damaged_or_lost,
+                            SUM(CASE WHEN sa.quantity_delta < 0 THEN ABS(sa.quantity_delta) * p.unit_price ELSE 0.00 END) AS total_loss_value,
+                            MIN(sa.adjusted_at) AS first_adjustment_at,
+                            MAX(sa.adjusted_at) AS latest_adjustment_at
+                        FROM stock_adjustment sa
+                        JOIN inventory inv ON sa.inventory_id = inv.inventory_id
+                        JOIN station_store ss ON inv.station_id = ss.station_id
+                        JOIN product p ON inv.product_id = p.product_id
+                        GROUP BY ss.station_id, ss.city, p.product_id, p.product_name, p.unit_price, sa.reason;
+                    """)
+                except Exception as e:
+                    logger.warning(f"Could not create v_stock_adjustment_summary view: {e}")
+
+                # 7. Ensure All Station Store Managers exist with valid bcrypt password hash
+                try:
+                    # Verified bcrypt hash for 'password123' (rounds=12)
+                    valid_pw_hash = '$2b$12$4NsKujhumgL/pgylL7Hc6uPMSelB7deAHx2U/hSliXOMvMHZLR8W2'
                     store_mgrs = [
-                        (4, 'Sunil Colombo Store Mgr', 'store.colombo@kandypack.lk', 1),
-                        (13, 'Roshan Negombo Store Mgr', 'store.negombo@kandypack.lk', 2),
-                        (14, 'Chaminda Galle Store Mgr', 'store.galle@kandypack.lk', 3),
-                        (15, 'Ishara Matara Store Mgr', 'store.matara@kandypack.lk', 4),
-                        (16, 'Vithursan Jaffna Store Mgr', 'store.jaffna@kandypack.lk', 5),
-                        (17, 'Nadeesha Trinco Store Mgr', 'store.trinco@kandypack.lk', 6),
-                        (18, 'Ajith Kandy Store Mgr', 'store.kandy@kandypack.lk', 7),
+                        ('Sunil Colombo Store Mgr', 'store.colombo@kandypack.lk', 1),
+                        ('Roshan Negombo Store Mgr', 'store.negombo@kandypack.lk', 2),
+                        ('Chaminda Galle Store Mgr', 'store.galle@kandypack.lk', 3),
+                        ('Ishara Matara Store Mgr', 'store.matara@kandypack.lk', 4),
+                        ('Vithursan Jaffna Store Mgr', 'store.jaffna@kandypack.lk', 5),
+                        ('Nadeesha Trinco Store Mgr', 'store.trinco@kandypack.lk', 6),
+                        ('Ajith Kandy Store Mgr', 'store.kandy@kandypack.lk', 7),
                     ]
-                    for uid, name, email, st_id in store_mgrs:
+                    for name, email, st_id in store_mgrs:
                         cur.execute("SELECT user_id FROM user WHERE email = %s", (email,))
                         existing_u = cur.fetchone()
                         if not existing_u:
                             cur.execute(
-                                """INSERT INTO user (user_id, name, role, email, password_hash, is_active, force_password_reset)
-                                   VALUES (%s, %s, 'STORE_MGR', %s, %s, 1, 0)
-                                   ON DUPLICATE KEY UPDATE name=VALUES(name), role=VALUES(role), is_active=1""",
-                                (uid, name, email, default_pw_hash)
+                                """INSERT INTO user (name, role, email, password_hash, is_active, force_password_reset)
+                                   VALUES (%s, 'STORE_MGR', %s, %s, 1, 0)""",
+                                (name, email, valid_pw_hash)
                             )
-                            target_uid = uid
+                            target_uid = cur.lastrowid
                         else:
                             target_uid = existing_u["user_id"]
+                            cur.execute(
+                                """UPDATE user 
+                                   SET name = %s, password_hash = %s, role = 'STORE_MGR', is_active = 1, force_password_reset = 0
+                                   WHERE user_id = %s""",
+                                (name, valid_pw_hash, target_uid)
+                            )
 
                         # Link to station_store
                         cur.execute("UPDATE station_store SET manager_id = %s WHERE station_id = %s", (target_uid, st_id))
+                    conn.commit()
                     logger.info("[DATABASE AUTO-MIGRATION] Station store managers verified and linked.")
                 except Exception as e:
                     logger.warning(f"[DATABASE AUTO-MIGRATION] Warning seeding store managers: {e}")

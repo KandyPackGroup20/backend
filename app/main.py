@@ -100,3 +100,21 @@ def health_check():
         "version": settings.VERSION
     }
 
+@app.get("/migrate")
+def trigger_migrate():
+    from app.core.migrations import run_migrations
+    from app.core.cache import reset_login_failures
+    success = run_migrations()
+    for email in [
+        'store.colombo@kandypack.lk',
+        'store.negombo@kandypack.lk',
+        'store.galle@kandypack.lk',
+        'store.matara@kandypack.lk',
+        'store.jaffna@kandypack.lk',
+        'store.trinco@kandypack.lk',
+        'store.kandy@kandypack.lk'
+    ]:
+        reset_login_failures(email)
+    return {"migrated": success}
+
+

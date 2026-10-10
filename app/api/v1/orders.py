@@ -32,9 +32,9 @@ CITY_TO_CODE = {
 
 def normalize_status(raw: str) -> str:
     r = (raw or "").upper()
-    if "DELIVER" in r or "COMPLETE" in r:
+    if r in ("DELIVERED", "COMPLETED"):
         return "delivered"
-    if "TRANSIT" in r or "SCHEDULED" in r or "ALLOCATED" in r:
+    if r == "OUT_FOR_DELIVERY" or "TRANSIT" in r or "SCHEDULED" in r or "ALLOCATED" in r:
         return "transit"
     if "CANCEL" in r or "FAIL" in r or "ISSUE" in r or "DELAY" in r:
         return "issue"
@@ -431,14 +431,16 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                 raise HTTPException(status_code=422, detail={"error_code": "ORDER_DESTINATION_REQUIRED", "message": "Provide a recipient name, phone and delivery address."})
 
             # 2. Dates
-            order_date = datetime.date.today()
+            order_date = datetime.datetime.now(ZoneInfo("Asia/Colombo")).date()
             if payload.booking_date:
                 try:
                     delivery_date = datetime.date.fromisoformat(payload.booking_date)
-                except Exception:
-                    delivery_date = order_date + datetime.timedelta(days=7)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail="booking_date must be an ISO date.") from exc
             else:
                 delivery_date = order_date + datetime.timedelta(days=7)
+            if delivery_date < order_date + datetime.timedelta(days=7):
+                raise HTTPException(status_code=422, detail="Delivery must be booked at least seven days in advance.")
 
             # 3. Insert customer_order
             cursor.execute(

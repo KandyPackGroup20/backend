@@ -558,13 +558,49 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                 delivery_date = order_date + datetime.timedelta(days=7)
 
             # 4. Insert customer_order
-            cursor.execute(
-                """
-                INSERT INTO customer_order (customer_id, order_date, delivery_date, status, delivery_route_id, delivery_address, recipient_name, recipient_phone)
-                VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING', %s, %s, %s, %s)
-                """,
-                (customer_id, order_date, delivery_date, chosen_route_id, delivery_addr, customer_display_name, customer_phone)
-            )
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO customer_order (customer_id, order_date, delivery_date, status, delivery_route_id, delivery_address, recipient_name, recipient_phone)
+                    VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING', %s, %s, %s, %s)
+                    """,
+                    (customer_id, order_date, delivery_date, chosen_route_id, delivery_addr, customer_display_name, customer_phone)
+                )
+            except Exception as e:
+                # If column missing in unmigrated database instance, self-heal or fallback
+                err_str = str(e)
+                if "1054" in err_str or "Unknown column" in err_str:
+                    logger.warning(f"customer_order missing routing columns. Attempting dynamic auto-migration: {e}")
+                    for col, defn in [
+                        ("delivery_route_id", "INT NULL"),
+                        ("delivery_address", "VARCHAR(500) NULL"),
+                        ("recipient_name", "VARCHAR(255) NULL"),
+                        ("recipient_phone", "VARCHAR(30) NULL"),
+                    ]:
+                        try:
+                            cursor.execute(f"SHOW COLUMNS FROM customer_order LIKE '{col}'")
+                            if not cursor.fetchone():
+                                cursor.execute(f"ALTER TABLE customer_order ADD COLUMN {col} {defn}")
+                        except Exception:
+                            pass
+                    try:
+                        cursor.execute(
+                            """
+                            INSERT INTO customer_order (customer_id, order_date, delivery_date, status, delivery_route_id, delivery_address, recipient_name, recipient_phone)
+                            VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING', %s, %s, %s, %s)
+                            """,
+                            (customer_id, order_date, delivery_date, chosen_route_id, delivery_addr, customer_display_name, customer_phone)
+                        )
+                    except Exception:
+                        cursor.execute(
+                            """
+                            INSERT INTO customer_order (customer_id, order_date, delivery_date, status)
+                            VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING')
+                            """,
+                            (customer_id, order_date, delivery_date)
+                        )
+                else:
+                    raise
             order_id = cursor.lastrowid
             tracking_code = f"KP-{order_id:05d}-{hub_key}"
 

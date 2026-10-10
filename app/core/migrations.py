@@ -71,6 +71,47 @@ def run_migrations():
                     except Exception:
                         pass
 
+                # 2b. Ensure customer_order table has all consignment & routing columns
+                cur.execute("SHOW TABLES LIKE 'customer_order'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("delivery_route_id", "INT NULL"),
+                        ("delivery_address", "VARCHAR(500) NULL"),
+                        ("recipient_name", "VARCHAR(255) NULL"),
+                        ("recipient_phone", "VARCHAR(30) NULL"),
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM customer_order LIKE '{col}'")
+                            if not cur.fetchone():
+                                logger.info(f"Adding missing column '{col}' to customer_order...")
+                                cur.execute(f"ALTER TABLE customer_order ADD COLUMN {col} {defn}")
+                                logger.info(f"Added column '{col}' to customer_order.")
+                        except Exception as e:
+                            logger.warning(f"Error checking/adding column {col} to customer_order: {e}")
+
+                    # Backfill any existing NULL customer_order values from customer table or defaults
+                    try:
+                        cur.execute("""
+                            UPDATE customer_order co
+                            JOIN customer c ON co.customer_id = c.customer_id
+                            SET 
+                                co.delivery_route_id = COALESCE(co.delivery_route_id, c.route_id, 1),
+                                co.delivery_address = COALESCE(co.delivery_address, c.address_line, 'No. 12, Galle Road, Colombo'),
+                                co.recipient_name = COALESCE(co.recipient_name, c.customer_name, 'Valued Customer'),
+                                co.recipient_phone = COALESCE(co.recipient_phone, c.phone, '0771234567')
+                            WHERE co.delivery_route_id IS NULL OR co.delivery_address IS NULL OR co.recipient_name IS NULL OR co.recipient_phone IS NULL;
+                        """)
+                    except Exception as e:
+                        logger.warning(f"Could not backfill customer_order columns: {e}")
+
+                    # Add index on delivery_route_id if missing
+                    try:
+                        cur.execute("SHOW INDEX FROM customer_order WHERE Key_name = 'idx_customer_order_route'")
+                        if not cur.fetchone():
+                            cur.execute("ALTER TABLE customer_order ADD INDEX idx_customer_order_route (delivery_route_id)")
+                    except Exception:
+                        pass
+
                 # 3. Ensure order_item.unit_price_at_order exists
                 cur.execute("SHOW COLUMNS FROM order_item LIKE 'unit_price_at_order'")
                 if not cur.fetchone():

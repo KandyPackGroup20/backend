@@ -510,18 +510,19 @@ def run_migrations():
                     cur.execute("""
                         CREATE OR REPLACE VIEW v_incoming_train_manifests AS
                         SELECT
-                            m.manifest_id,
-                            m.station_id,
+                            COALESCE(m.manifest_id, tt.trip_id) AS manifest_id,
+                            tt.destination_station_id AS station_id,
                             ss.city AS destination_station,
                             tt.trip_id,
                             tt.departure_datetime,
                             tt.arrival_datetime,
                             tt.status AS train_status,
-                            m.status AS manifest_status,
+                            COALESCE(m.status, 'PENDING') AS manifest_status,
                             m.received_at
-                        FROM manifest m
-                        JOIN train_trip tt ON m.trip_id = tt.trip_id
-                        JOIN station_store ss ON m.station_id = ss.station_id;
+                        FROM train_trip tt
+                        JOIN station_store ss ON tt.destination_station_id = ss.station_id
+                        LEFT JOIN manifest m ON m.trip_id = tt.trip_id AND m.station_id = tt.destination_station_id
+                        WHERE tt.status IN ('SCHEDULED', 'IN_TRANSIT', 'ARRIVED');
                     """)
                 except Exception as e:
                     logger.warning(f"Could not create v_incoming_train_manifests view: {e}")
@@ -1168,8 +1169,29 @@ def run_migrations():
                 except Exception as e:
                     logger.warning(f"[DATABASE AUTO-MIGRATION] Warning creating trigger: {e}")
 
-                # 11. Ensure all scheduled train trips have a pending manifest, and align trips/allocations for Order 1015
+                # 11. Ensure all scheduled train trips have a pending manifest, and guarantee scheduled trips for all destination hubs
                 try:
+                    dest_trips = [
+                        (1, '2026-10-11 06:00:00', '2026-10-11 09:30:00', 50.0),
+                        (2, '2026-10-11 08:00:00', '2026-10-11 12:00:00', 50.0),
+                        (3, '2026-10-10 20:00:00', '2026-10-11 06:00:00', 50.0),
+                        (4, '2026-10-11 07:00:00', '2026-10-11 12:00:00', 50.0),
+                        (5, '2026-10-11 06:00:00', '2026-10-11 14:00:00', 60.0),
+                        (6, '2026-10-11 08:00:00', '2026-10-11 13:30:00', 50.0),
+                    ]
+                    for dest_id, dep, arr, cap in dest_trips:
+                        cur.execute("""
+                            SELECT trip_id FROM train_trip 
+                            WHERE destination_station_id = %s AND status = 'SCHEDULED'
+                            LIMIT 1
+                        """, (dest_id,))
+                        existing = cur.fetchone()
+                        if not existing:
+                            cur.execute("""
+                                INSERT INTO train_trip (origin_station_id, destination_station_id, departure_datetime, arrival_datetime, total_capacity, status)
+                                VALUES (7, %s, %s, %s, %s, 'SCHEDULED')
+                            """, (dest_id, dep, arr, cap))
+
                     cur.execute("""
                         INSERT INTO manifest (station_id, trip_id, status)
                         SELECT DISTINCT tt.destination_station_id, tt.trip_id, 'PENDING'
@@ -1186,30 +1208,33 @@ def run_migrations():
                         WHERE trip_id = 4 AND status = 'SCHEDULED';
                     """)
 
-                    cur.execute("""
-                        SELECT COUNT(*) AS alloc_count FROM rail_allocation ra
-                        JOIN order_item oi ON ra.order_item_id = oi.order_item_id
-                        WHERE oi.order_id = 1015;
-                    """)
-                    alloc_check = cur.fetchone()
-                    if alloc_check and alloc_check["alloc_count"] == 0:
+                    # Align Order 1015 if present
+                    cur.execute("SELECT trip_id FROM train_trip WHERE trip_id = 4;")
+                    if cur.fetchone():
                         cur.execute("""
-                            INSERT INTO rail_allocation (trip_id, order_item_id, allocated_quantity, allocated_space)
-                            SELECT 4, oi.order_item_id, oi.quantity, (oi.quantity * p.space_consumption_rate)
-                            FROM order_item oi
-                            JOIN product p ON oi.product_id = p.product_id
+                            SELECT COUNT(*) AS alloc_count FROM rail_allocation ra
+                            JOIN order_item oi ON ra.order_item_id = oi.order_item_id
                             WHERE oi.order_id = 1015;
                         """)
-                        cur.execute("UPDATE customer_order SET status = 'SCHEDULED_FOR_RAIL' WHERE order_id = 1015;")
-                        cur.execute("""
-                            INSERT INTO manifest (station_id, trip_id, status)
-                            VALUES (3, 4, 'PENDING')
-                            ON DUPLICATE KEY UPDATE manifest_id = manifest_id;
-                        """)
+                        alloc_check = cur.fetchone()
+                        if alloc_check and alloc_check["alloc_count"] == 0:
+                            cur.execute("""
+                                INSERT INTO rail_allocation (trip_id, order_item_id, allocated_quantity, allocated_space)
+                                SELECT 4, oi.order_item_id, oi.quantity, (oi.quantity * p.space_consumption_rate)
+                                FROM order_item oi
+                                JOIN product p ON oi.product_id = p.product_id
+                                WHERE oi.order_id = 1015;
+                            """)
+                            cur.execute("UPDATE customer_order SET status = 'SCHEDULED_FOR_RAIL' WHERE order_id = 1015;")
+                            cur.execute("""
+                                INSERT INTO manifest (station_id, trip_id, status)
+                                VALUES (3, 4, 'PENDING')
+                                ON DUPLICATE KEY UPDATE manifest_id = manifest_id;
+                            """)
                     conn.commit()
-                    logger.info("[DATABASE AUTO-MIGRATION] Manifests backfilled and Order 1015 rail allocation aligned.")
+                    logger.info("[DATABASE AUTO-MIGRATION] Multi-station train trips and manifests verified.")
                 except Exception as e:
-                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning backfilling manifests/Order 1015: {e}")
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning backfilling manifests/trips: {e}")
 
                 conn.commit()
                 logger.info("[DATABASE AUTO-MIGRATION] All schema verifications and views created successfully.")

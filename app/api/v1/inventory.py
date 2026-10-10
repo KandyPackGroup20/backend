@@ -99,7 +99,7 @@ def get_station_inventory(
 def get_incoming_manifests(
     station_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None, description="PENDING or RECEIVED"),
-    current_user: dict = Depends(require_roles(["STORE_MGR", "SUPERADMIN"]))
+    current_user: dict = Depends(require_roles(["STORE_MGR", "SUPERADMIN", "LOGISTICS_MGR"]))
 ):
     """Feature 4.4: train arrivals waiting to be (or already) processed at a station."""
     with get_db() as conn:
@@ -135,8 +135,12 @@ def get_manifest_cargo_items(
         with conn.cursor() as cursor:
             if assigned_station_id is not None:
                 cursor.execute(
-                    "SELECT 1 FROM manifest WHERE trip_id = %s AND station_id = %s",
-                    (trip_id, assigned_station_id)
+                    """
+                    SELECT 1 FROM train_trip tt
+                    LEFT JOIN manifest m ON m.trip_id = tt.trip_id
+                    WHERE tt.trip_id = %s AND (tt.destination_station_id = %s OR m.station_id = %s)
+                    """,
+                    (trip_id, assigned_station_id, assigned_station_id)
                 )
                 if not cursor.fetchone():
                     raise HTTPException(status_code=403, detail="FORBIDDEN_STATION: Trip manifest does not arrive at your assigned station.")
@@ -152,7 +156,7 @@ def get_manifest_cargo_items(
 @router.get("/bins")
 def get_station_bins(
     station_id: int = Query(..., description="Station ID to fetch bins for"),
-    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN"]))
+    current_user: dict = Depends(require_roles(["STORE_MGR", "WAREHOUSE_STAFF", "SUPERADMIN", "LOGISTICS_MGR"]))
 ):
     """Feature 4.4 / FR-4.4.6: List bin storage locations available at a station store."""
     with get_db() as conn:

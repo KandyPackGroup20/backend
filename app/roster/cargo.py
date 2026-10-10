@@ -132,9 +132,13 @@ def reading():
 
 
 class CargoRepository:
-    def stores(self):
+    def stores(self, user=None):
         with reading() as cursor:
-            cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 ORDER BY city, station_id")
+            station_id = user.get("station_id") if user and user.get("role") == "DISPATCHER" else None
+            if station_id:
+                cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 AND station_id=%s ORDER BY city, station_id", (station_id,))
+            else:
+                cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 ORDER BY city, station_id")
             return {"stores": cursor.fetchall(), "timezone": "Asia/Colombo"}
 
     def _orders(self, cursor, where, params):
@@ -245,6 +249,9 @@ class CargoRepository:
                             delivery_id = cursor.lastrowid
                             cursor.execute("INSERT INTO audit_log (user_id,action,entity_id,outcome,entity_name,roster_id,occurred_at) VALUES (%s,'ASSIGN_ORDER_TO_ROSTER',%s,'ACCEPTED','delivery',NULL,%s)",
                                            (actor_id, delivery_id, now))
+                            cursor.execute("UPDATE customer_order SET status = 'OUT_FOR_DELIVERY' WHERE order_id = %s", (order["order_id"],))
+                            cursor.execute("INSERT INTO order_status_history (status, order_id, changed_by, changed_at) VALUES ('OUT_FOR_DELIVERY', %s, %s, %s)",
+                                           (order["order_id"], actor_id, now))
                     result = {"status": "SUCCESS", "result_code": "ORDERS_ASSIGNED" if new_orders else "ORDERS_ALREADY_ASSIGNED",
                               "roster_id": roster_id, "order_ids": ids, "cargo_weight_kg": money(total), "timezone": "Asia/Colombo"}
                     conn.commit()

@@ -35,6 +35,9 @@ class LoginResponse(BaseModel):
     full_name: str
     role: str
     force_password_reset: bool
+    station_id: Optional[int] = None
+    access_token: Optional[str] = None
+    token_type: Optional[str] = "bearer"
     message: str
 
 class CustomerRegisterRequest(BaseModel):
@@ -53,6 +56,7 @@ class StaffCreateRequest(BaseModel):
     role: Literal["SUPERADMIN", "LOGISTICS_MGR", "DISPATCHER", "STORE_MGR", "WAREHOUSE_STAFF", "DRIVER", "ASSISTANT"] # 'LOGISTICS_MGR', 'DISPATCHER', 'STORE_MGR', 'WAREHOUSE_STAFF', 'DRIVER', 'ASSISTANT', 'SUPERADMIN'
     password: str = Field(min_length=6)
     license_number: Optional[str] = Field(default=None, max_length=100)
+    station_id: Optional[int] = Field(default=None, description="Regional hub station ID (1=Colombo, 2=Negombo, 3=Galle, etc.)")
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -69,6 +73,8 @@ class UserProfileResponse(BaseModel):
     city: Optional[str] = None
     address_line: Optional[str] = None
     route_id: Optional[int] = None
+    station_id: Optional[int] = None
+    station_name: Optional[str] = None
 
 class ProfileUpdateRequest(BaseModel):
     name: str = Field(min_length=2)
@@ -105,7 +111,7 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                 # fetch user
                 cursor.execute(
                     """
-                    SELECT user_id, email, password_hash, name, role, force_password_reset 
+                    SELECT user_id, email, password_hash, name, role, force_password_reset, station_id 
                     FROM user 
                     WHERE email = %s AND is_active = 1
                     """,
@@ -152,6 +158,7 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                     "email": user['email'],
                     "name": user['name'],
                     "role": user['role'],
+                    "station_id": user.get('station_id'),
                     "force_password_reset": force_reset
                 })
                 
@@ -171,6 +178,7 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                     "email": user['email'],
                     "full_name": user['name'],
                     "role": user['role'],
+                    "station_id": user.get('station_id'),
                     "force_password_reset": force_reset,
                     "message": "Login successful"
                 }
@@ -318,14 +326,16 @@ def create_staff_user(
                 cursor.execute("SET @kandypack_staff_provisioning = 1")
                 cursor.execute(
                     """
-                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
-                    VALUES (%s, %s, %s, %s, 1, 1)
+                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active, station_id)
+                    VALUES (%s, %s, %s, %s, 1, 1, %s)
                     """,
-                    (payload.name, payload.role, payload.email, pw_hash)
+                    (payload.name, payload.role, payload.email, pw_hash, payload.station_id)
                 )
                 user_id = cursor.lastrowid
                 if payload.role in {"DRIVER", "ASSISTANT"}:
                     cursor.execute("INSERT INTO delivery_staff (user_id, license_number, work_hours) VALUES (%s, %s, 0)", (user_id, payload.license_number))
+                if payload.role == "STORE_MGR" and payload.station_id:
+                    cursor.execute("UPDATE station_store SET manager_id = %s WHERE station_id = %s", (user_id, payload.station_id))
                 conn.commit()
             except HTTPException:
                 raise
@@ -342,6 +352,7 @@ def create_staff_user(
                 "name": payload.name,
                 "email": payload.email,
                 "role": payload.role,
+                "station_id": payload.station_id,
                 "force_password_reset": True,
                 "message": f"Successfully created employee account for {payload.name} as {payload.role}."
             }
@@ -355,9 +366,11 @@ def list_all_users(current_user: dict = Depends(require_roles(["SUPERADMIN"]))):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT user_id, name, role, email, force_password_reset, is_active, created_at
-                FROM user
-                ORDER BY user_id ASC
+                SELECT u.user_id, u.name, u.role, u.email, u.force_password_reset, u.is_active, u.created_at,
+                       u.station_id, ss.city AS station_name
+                FROM user u
+                LEFT JOIN station_store ss ON ss.station_id = u.station_id
+                ORDER BY u.user_id ASC
                 """
             )
             users = cursor.fetchall()
@@ -367,6 +380,8 @@ def list_all_users(current_user: dict = Depends(require_roles(["SUPERADMIN"]))):
                     "name": u["name"],
                     "role": u["role"],
                     "email": u["email"],
+                    "station_id": u.get("station_id"),
+                    "station_name": u.get("station_name"),
                     "force_password_reset": bool(u["force_password_reset"]),
                     "is_active": bool(u["is_active"]),
                     "created_at": str(u["created_at"]) if u.get("created_at") else None
@@ -439,10 +454,11 @@ def get_current_user_profile(current_user: dict = Depends(get_current_user)):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT u.user_id, u.name, u.email, u.role, u.force_password_reset,
+                SELECT u.user_id, u.name, u.email, u.role, u.force_password_reset, u.station_id, ss.city AS station_name,
                        c.customer_id, c.phone, c.city, c.address_line, c.route_id
                 FROM user u
                 LEFT JOIN customer c ON u.user_id = c.user_id
+                LEFT JOIN station_store ss ON u.station_id = ss.station_id
                 WHERE u.user_id = %s AND u.is_active = 1
                 """,
                 (current_user["user_id"],)
@@ -461,7 +477,9 @@ def get_current_user_profile(current_user: dict = Depends(get_current_user)):
                 "phone": profile.get("phone"),
                 "city": profile.get("city"),
                 "address_line": profile.get("address_line"),
-                "route_id": profile.get("route_id")
+                "route_id": profile.get("route_id"),
+                "station_id": profile.get("station_id"),
+                "station_name": profile.get("station_name"),
             }
 
 @router.put("/me", response_model=UserProfileResponse)

@@ -68,7 +68,7 @@ class Route(FrozenModel):
 
 class Truck(FrozenModel):
     truck_id: PositiveInt
-    station_id: str | None = Field(min_length=1)
+    station_id: str | None = Field(default=None, min_length=1)
     plate_number: str
     is_active: bool
     capacity: str | None = None
@@ -80,6 +80,7 @@ class Staff(FrozenModel):
     person_id: PositiveInt
     name: str
     staff_type: Literal["DRIVER", "ASSISTANT"]
+    station_id: str | None = Field(default=None, min_length=1)
 
 
 class Assignment(FrozenModel):

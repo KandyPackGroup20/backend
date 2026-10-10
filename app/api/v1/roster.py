@@ -5,14 +5,17 @@ import re
 import os
 import pymysql
 from datetime import date, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.security import require_roles
 
 from app.roster.dependencies import (
     get_roster_assignment_repository, get_roster_reporting_repository, get_roster_repository,
@@ -257,9 +260,13 @@ def assign_roster(
         ) from exc
 
 
+class DriverDeliveryCompleteRequest(BaseModel):
+    proof_reference: Optional[str] = Field("Handed over to recipient, signed.", max_length=500)
+
+
 @router.get("/stores", response_model=StoresResponse)
 def cargo_stores(user: dict = Depends(require_roster_reader), repository=Depends(get_cargo_repository)):
-    return cargo_operation(repository.stores)
+    return cargo_operation(lambda: repository.stores(user))
 
 
 @router.get("/demand", response_model=DemandResponse)
@@ -286,3 +293,112 @@ def cargo_loading_list(roster_id: int, user: dict = Depends(require_roster_reade
 def assign_whole_orders(roster_id: int, request: CargoSelection,
                         user: dict = Depends(require_roster_writer), repository=Depends(get_cargo_repository)):
     return cargo_operation(lambda: repository.assign(roster_id, request.order_ids, user["user_id"]))
+
+
+@router.get("/driver/my-deliveries")
+def get_driver_deliveries(
+    current_user: dict = Depends(require_roles(["DRIVER", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
+):
+    """Driver views their assigned delivery runs and order stops."""
+    from app.core.database import get_db
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            params = []
+            where_sql = "d.delivery_status <> 'CANCELLED'"
+            if current_user["role"] == "DRIVER":
+                cursor.execute("SELECT delivery_staff_id FROM delivery_staff WHERE user_id = %s", (current_user["user_id"],))
+                ds = cursor.fetchone()
+                if not ds:
+                    return {"deliveries": []}
+                where_sql += " AND ra.driver_id = %s"
+                params.append(ds["delivery_staff_id"])
+
+            sql = f"""
+                SELECT 
+                    d.delivery_id,
+                    d.order_id,
+                    d.delivery_status,
+                    d.cargo_weight_kg,
+                    d.proof_reference,
+                    d.delivered_at,
+                    ra.roster_id,
+                    ra.start_time,
+                    ra.end_time,
+                    ra.status AS run_status,
+                    t.plate_number AS truck_plate,
+                    dr.route_name,
+                    ss.city AS station_name,
+                    co.recipient_name,
+                    co.recipient_phone,
+                    co.delivery_address,
+                    co.status AS order_status
+                FROM delivery d
+                JOIN roster_assignment ra ON ra.roster_id = d.roster_id
+                JOIN truck t ON t.truck_id = ra.truck_id
+                JOIN delivery_route dr ON dr.route_id = ra.route_id
+                JOIN station_store ss ON ss.station_id = dr.station_id
+                JOIN customer_order co ON co.order_id = d.order_id
+                WHERE {where_sql}
+                ORDER BY d.delivery_id DESC
+            """
+            cursor.execute(sql, tuple(params))
+            rows = cursor.fetchall()
+            for r in rows:
+                if r.get("delivered_at") and isinstance(r["delivered_at"], datetime):
+                    r["delivered_at"] = r["delivered_at"].strftime("%Y-%m-%d %H:%M:%S")
+                if r.get("start_time") and isinstance(r["start_time"], datetime):
+                    r["start_time"] = r["start_time"].strftime("%Y-%m-%d %H:%M:%S")
+                if r.get("end_time") and isinstance(r["end_time"], datetime):
+                    r["end_time"] = r["end_time"].strftime("%Y-%m-%d %H:%M:%S")
+                r["cargo_weight_kg"] = str(r["cargo_weight_kg"])
+            return {"deliveries": rows}
+
+
+@router.post("/deliveries/{delivery_id}/complete")
+def complete_driver_delivery(
+    delivery_id: int,
+    payload: DriverDeliveryCompleteRequest = DriverDeliveryCompleteRequest(),
+    current_user: dict = Depends(require_roles(["DRIVER", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
+):
+    """Complete a specific delivery run stop and update the related customer order."""
+    from app.core.database import get_db
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT d.delivery_id, d.order_id, d.roster_id, d.delivery_status, co.customer_id
+                FROM delivery d
+                JOIN customer_order co ON co.order_id = d.order_id
+                WHERE d.delivery_id = %s
+            """, (delivery_id,))
+            deliv = cursor.fetchone()
+            if not deliv:
+                raise HTTPException(status_code=404, detail="Delivery record not found.")
+
+            now = datetime.now()
+            cursor.execute("""
+                UPDATE delivery 
+                SET delivery_status = 'DELIVERED', delivered_at = %s, proof_reference = %s
+                WHERE delivery_id = %s
+            """, (now, payload.proof_reference or "Handed over to recipient, signed.", delivery_id))
+
+            cursor.execute("UPDATE customer_order SET status = 'DELIVERED' WHERE order_id = %s", (deliv["order_id"],))
+            cursor.execute("""
+                INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
+                VALUES ('DELIVERED', %s, %s, %s)
+            """, (deliv["order_id"], current_user["user_id"], now))
+
+            # Send notification
+            cursor.execute("SELECT u.email, u.user_id FROM customer c JOIN `user` u ON u.user_id = c.user_id WHERE c.customer_id = %s", (deliv["customer_id"],))
+            cust_u = cursor.fetchone()
+            if cust_u:
+                cursor.execute("""
+                    INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                    VALUES (%s, %s, 'DELIVERY_UPDATE', 'Consignment Delivered to Doorstep', %s, %s, 0, %s)
+                """, (
+                    cust_u["user_id"], cust_u["email"],
+                    f"Your order #{deliv['order_id']} has been delivered. Please inspect and confirm receipt.",
+                    deliv["order_id"], now
+                ))
+
+            conn.commit()
+            return {"status": "SUCCESS", "message": f"Delivery #{delivery_id} marked as DELIVERED.", "order_id": deliv["order_id"]}

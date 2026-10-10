@@ -40,7 +40,15 @@ def _get_user_assigned_station_id(current_user: dict, conn) -> Optional[int]:
     if current_user.get("role") not in ["STORE_MGR", "WAREHOUSE_STAFF"]:
         return None
 
+    if current_user.get("station_id"):
+        return current_user["station_id"]
+
     with conn.cursor() as cursor:
+        cursor.execute("SELECT station_id FROM `user` WHERE user_id = %s", (current_user["user_id"],))
+        u_row = cursor.fetchone()
+        if u_row and u_row.get("station_id"):
+            return u_row["station_id"]
+
         cursor.execute("SELECT station_id FROM station_store WHERE manager_id = %s", (current_user["user_id"],))
         row = cursor.fetchone()
         if row and row.get("station_id"):
@@ -192,12 +200,43 @@ def assign_bin_location(
                 if not cursor.fetchone():
                     raise HTTPException(status_code=400, detail="INVALID_BIN: Selected bin does not belong to this station store.")
 
+            cursor.execute("SELECT inventory_id FROM inventory WHERE inventory_id = %s", (inventory_id,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Inventory item not found.")
+
             cursor.execute(
                 "UPDATE inventory SET location_id = %s WHERE inventory_id = %s",
                 (payload.location_id, inventory_id)
             )
-            if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Inventory item not found.")
+
+            # If bin assigned, update arrived orders for this product to STORED_IN_WAREHOUSE
+            if payload.location_id is not None:
+                cursor.execute("""
+                    SELECT inv.station_id, inv.product_id, sl.location_code
+                    FROM inventory inv
+                    JOIN storage_location sl ON sl.location_id = inv.location_id
+                    WHERE inv.inventory_id = %s
+                """, (inventory_id,))
+                inv_info = cursor.fetchone()
+                if inv_info:
+                    cursor.execute("""
+                        SELECT DISTINCT co.order_id
+                        FROM customer_order co
+                        JOIN order_item oi ON oi.order_id = co.order_id
+                        JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                        WHERE dr.station_id = %s
+                          AND oi.product_id = %s
+                          AND co.status IN ('ARRIVED_AT_STATION_STORE', 'ARRIVED')
+                    """, (inv_info["station_id"], inv_info["product_id"]))
+                    arrived_orders = cursor.fetchall()
+                    for o_row in arrived_orders:
+                        oid = o_row["order_id"]
+                        cursor.execute("UPDATE customer_order SET status = 'STORED_IN_WAREHOUSE' WHERE order_id = %s", (oid,))
+                        cursor.execute("""
+                            INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
+                            VALUES ('STORED_IN_WAREHOUSE', %s, %s, NOW())
+                        """, (oid, current_user["user_id"]))
+
             conn.commit()
 
             cursor.execute("SELECT * FROM v_station_inventory WHERE inventory_id = %s", (inventory_id,))

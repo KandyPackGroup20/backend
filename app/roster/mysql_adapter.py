@@ -30,12 +30,12 @@ ROUTES_SQL = """
     FROM delivery_route ORDER BY route_id
 """
 TRUCKS_SQL = """
-    SELECT truck_id, plate_number, is_active, capacity, capacity_unit
+    SELECT truck_id, plate_number, is_active, capacity, capacity_unit, station_id
     FROM truck WHERE is_active = %s ORDER BY truck_id
 """
 STAFF_SQL = """
     SELECT ds.delivery_staff_id AS staff_id, ds.user_id AS person_id,
-           u.name, u.role AS staff_type
+           u.name, u.role AS staff_type, u.station_id
     FROM delivery_staff AS ds
     INNER JOIN `user` AS u ON u.user_id = ds.user_id
     WHERE u.is_active = %s AND u.role IN (%s, %s)
@@ -338,7 +338,8 @@ class MySQLRosterAdapter:
                 if type(row["is_active"]) not in (int, bool) or row["is_active"] != 1:
                     raise _invalid()
                 trucks.append(Truck(
-                    truck_id=_positive_integer(row["truck_id"]), station_id=None,
+                    truck_id=_positive_integer(row["truck_id"]),
+                    station_id=str(row["station_id"]) if row.get("station_id") else None,
                     plate_number=_text(row["plate_number"]), is_active=True,
                     capacity=format(Decimal(row["capacity"]), ".2f"), capacity_unit=row["capacity_unit"],
                 ))
@@ -347,6 +348,7 @@ class MySQLRosterAdapter:
                 staff_id=_positive_integer(row["staff_id"]),
                 person_id=_positive_integer(row["person_id"]),
                 name=_text(row["name"]), staff_type=row["staff_type"],
+                station_id=str(row["station_id"]) if row.get("station_id") else None,
             ) for row in cursor.fetchall())
             return CandidatesResponse(
                 routes=routes, trucks=tuple(trucks),

@@ -91,6 +91,12 @@ class MilestoneSchema(BaseModel):
     completed: bool
     active: bool
 
+class DeliverOrderRequest(BaseModel):
+    proof_reference: Optional[str] = Field("Handed over to recipient, signed.", max_length=500)
+
+class ConfirmReceiptRequest(BaseModel):
+    notes: Optional[str] = Field(None, max_length=500)
+
 class OrderTrackingResponse(BaseModel):
     id: str
     order_id: int
@@ -104,6 +110,14 @@ class OrderTrackingResponse(BaseModel):
     recipient: str
     amount: float
     milestones: List[MilestoneSchema]
+    raw_status: Optional[str] = None
+    can_confirm_receipt: Optional[bool] = False
+    driver_name: Optional[str] = None
+    driver_phone: Optional[str] = None
+    truck_plate: Optional[str] = None
+    warehouse_bin: Optional[str] = None
+    proof_reference: Optional[str] = None
+    delivered_at: Optional[str] = None
 
 
 @router.get("", response_model=List[OrderItemSchema])
@@ -281,6 +295,50 @@ def get_order_catalogue():
             ]
 
 
+@router.get("/routes")
+def get_available_routes(hub: Optional[str] = None):
+    """Return available delivery routes, optionally filtered by destination hub or city."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            city_filter = None
+            if hub:
+                hub_key = hub.strip().upper()
+                hub_info = HUB_CODE_MAP.get(hub_key)
+                if not hub_info:
+                    for k, v in HUB_CODE_MAP.items():
+                        if v["name"].lower() == hub.lower():
+                            hub_info = v
+                            break
+                if hub_info:
+                    city_filter = hub_info["city"]
+                else:
+                    city_filter = hub
+
+            if city_filter:
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, dr.station_id, dr.max_delivery_time,
+                           ss.city, ss.address AS station_address
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE LOWER(ss.city) = LOWER(%s) AND ss.is_active = 1
+                    ORDER BY dr.route_id
+                """, (city_filter,))
+            else:
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, dr.station_id, dr.max_delivery_time,
+                           ss.city, ss.address AS station_address
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE ss.is_active = 1
+                    ORDER BY ss.city, dr.route_id
+                """)
+            routes = cursor.fetchall()
+            for r in routes:
+                if "max_delivery_time" in r and isinstance(r["max_delivery_time"], datetime.timedelta):
+                    r["max_delivery_time"] = str(r["max_delivery_time"])
+            return routes
+
+
 @router.get("/{tracking_id}", response_model=OrderTrackingResponse)
 def get_order_tracking(tracking_id: str,
                        current_user: dict = Depends(require_roles(["CUSTOMER", "SUPERADMIN", "LOGISTICS_MGR", "DISPATCHER", "STORE_MGR", "WAREHOUSE_STAFF"]))):
@@ -377,66 +435,185 @@ def get_order_tracking(tracking_id: str,
                 t = alloc_trips[0]
                 dep_dt = t["departure_datetime"].strftime("%b %d, %I:%M %p") if t.get("departure_datetime") else f"{date_str} 06:10 AM"
                 arr_dt = t["arrival_datetime"].strftime("%b %d, %I:%M %p") if t.get("arrival_datetime") else f"{date_str} 10:45 AM"
+            # Query real rail allocation trip details
+            cursor.execute(
+                """
+                SELECT DISTINCT tt.trip_id, tt.departure_datetime, tt.arrival_datetime
+                FROM rail_allocation ra
+                JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                JOIN train_trip tt ON ra.trip_id = tt.trip_id
+                WHERE oi.order_id = %s
+                ORDER BY tt.departure_datetime ASC
+                """,
+                (oid,)
+            )
+            alloc_trips = cursor.fetchall()
+            if alloc_trips:
+                t = alloc_trips[0]
+                dep_dt = t["departure_datetime"].strftime("%b %d, %I:%M %p") if t.get("departure_datetime") else f"{date_str} 06:10 AM"
+                arr_dt = t["arrival_datetime"].strftime("%b %d, %I:%M %p") if t.get("arrival_datetime") else f"{date_str} 10:45 AM"
                 train_slot = f"Train Trip #{t['trip_id']} (Dep: {dep_dt} → Arr: {arr_dt})"
             else:
                 dep_dt = f"{date_str} 06:10 AM"
                 arr_dt = f"{date_str} 10:45 AM"
                 train_slot = row["allocated_train_slot"]
 
-            is_scheduled = row["raw_status"] in ("SCHEDULED_FOR_RAIL", "SCHEDULED_MULTI_TRIP")
-            is_arrived = row["raw_status"] in ("ARRIVED_AT_STATION_STORE", "ARRIVED") or norm_status == "arrived"
-            is_delivered = norm_status == "delivered"
+            # Query warehouse bin info
+            cursor.execute("""
+                SELECT DISTINCT sl.location_code
+                FROM order_item oi
+                JOIN customer_order co ON co.order_id = oi.order_id
+                JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                JOIN inventory inv ON inv.product_id = oi.product_id AND inv.station_id = dr.station_id
+                JOIN storage_location sl ON sl.location_id = inv.location_id
+                WHERE oi.order_id = %s AND sl.location_code IS NOT NULL
+                LIMIT 1
+            """, (oid,))
+            bin_row = cursor.fetchone()
+            bin_code = bin_row["location_code"] if bin_row else None
 
-            # Dynamic milestone generation based on real order state
+            # Query delivery / driver info
+            cursor.execute("""
+                SELECT d.delivery_id, d.delivery_status, d.proof_reference, d.delivered_at,
+                       t.plate_number, u_driver.name AS driver_name, u_driver.email AS driver_email,
+                       u_ast.name AS assistant_name, ra.roster_id
+                FROM delivery d
+                JOIN roster_assignment ra ON ra.roster_id = d.roster_id
+                JOIN truck t ON t.truck_id = ra.truck_id
+                JOIN delivery_staff ds_driver ON ds_driver.delivery_staff_id = ra.driver_id
+                JOIN `user` u_driver ON u_driver.user_id = ds_driver.user_id
+                JOIN delivery_staff ds_ast ON ds_ast.delivery_staff_id = ra.assistant_id
+                JOIN `user` u_ast ON u_ast.user_id = ds_ast.user_id
+                WHERE d.order_id = %s AND d.delivery_status <> 'CANCELLED'
+                ORDER BY d.delivery_id DESC LIMIT 1
+            """, (oid,))
+            deliv_row = cursor.fetchone()
+
+            raw_st = (row["raw_status"] or "PENDING_RAIL_SCHEDULING").upper()
+            is_rail_scheduled = raw_st in ("SCHEDULED_FOR_RAIL", "SCHEDULED_MULTI_TRIP")
+            is_arrived = raw_st in ("ARRIVED_AT_STATION_STORE", "ARRIVED")
+            is_stored = raw_st == "STORED_IN_WAREHOUSE"
+            is_out_for_delivery = raw_st in ("OUT_FOR_DELIVERY", "IN_TRANSIT_LAST_MILE")
+            is_delivered = raw_st == "DELIVERED"
+            is_completed = raw_st == "COMPLETED"
+
+            m1_done = True
+            m1_active = raw_st == "PENDING_RAIL_SCHEDULING"
+
+            m2_done = is_rail_scheduled or is_arrived or is_stored or is_out_for_delivery or is_delivered or is_completed
+            m2_active = is_rail_scheduled
+
+            m3_done = is_arrived or is_stored or is_out_for_delivery or is_delivered or is_completed
+            m3_active = (is_rail_scheduled and not is_arrived)
+
+            m4_done = is_arrived or is_stored or is_out_for_delivery or is_delivered or is_completed
+            m4_active = is_arrived
+
+            m5_done = is_stored or is_out_for_delivery or is_delivered or is_completed or (bin_code is not None)
+            m5_active = is_stored
+
+            m6_done = is_out_for_delivery or is_delivered or is_completed or (deliv_row is not None)
+            m6_active = is_out_for_delivery
+
+            m7_done = is_delivered or is_completed
+            m7_active = is_delivered
+
+            m8_done = is_completed
+            m8_active = is_completed
+
+            driver_display_name = deliv_row["driver_name"] if deliv_row else "Driver Assigned"
+            truck_display_plate = deliv_row["plate_number"] if deliv_row else "Road Delivery Fleet"
+
+            # 8 Connected Journey Milestones
             milestones = [
                 MilestoneSchema(
-                    title="Order Received & Palletized",
+                    title="1. Order Received & Palletized",
                     location="Kandy Logistics Hub, Peradeniya Rd",
                     time=f"{date_str} 05:15 AM",
                     description="Freight verified, weighed, and queued for rail allocation.",
-                    completed=True,
-                    active=norm_status == "pending"
+                    completed=m1_done,
+                    active=m1_active
                 ),
                 MilestoneSchema(
-                    title="Rail Carriage Allocated",
+                    title="2. Rail Carriage Allocated",
                     location="Kandy Central Railway Goods Yard",
                     time=dep_dt,
                     description=f"Loaded onto SLR freight wagon. {train_slot}." if alloc_trips else f"Carriage slot assigned: {train_slot}.",
-                    completed=is_scheduled or is_arrived or is_delivered or norm_status == "transit",
-                    active=is_scheduled
+                    completed=m2_done,
+                    active=m2_active
                 ),
                 MilestoneSchema(
-                    title=f"Rail Transit toward {dest_city}",
+                    title=f"3. Rail Transit toward {dest_city}",
                     location=f"Mainline Rail Corridor to {dest_city}",
                     time=dep_dt,
-                    description=f"Heavy freight transit progressing on schedule to {dest_city} Railway Goods Yard.",
-                    completed=is_arrived or is_delivered,
-                    active=(norm_status == "transit" and not is_arrived)
+                    description=f"Heavy rail freight transit progressing on schedule to {dest_city} Goods Yard.",
+                    completed=m3_done,
+                    active=m3_active
                 ),
                 MilestoneSchema(
-                    title=f"Arrival at {dest_city} Regional Hub",
+                    title=f"4. Arrived at {dest_city} Regional Hub",
                     location=hub_addr,
-                    time=arr_dt if not is_arrived else f"Arrived {arr_dt}",
+                    time=arr_dt if not m4_done else f"Arrived {arr_dt}",
                     description=(
                         f"Train arrived at {dest_city} Goods Yard. Consignment inspected & confirmed received by Station Store Manager."
-                        if (is_arrived or is_delivered)
+                        if m4_done
                         else f"Estimated train arrival: {arr_dt}. Awaiting Store Manager verification and unloading at {dest_city} Hub."
                     ),
-                    completed=is_arrived or is_delivered,
-                    active=is_arrived
+                    completed=m4_done,
+                    active=m4_active
                 ),
                 MilestoneSchema(
-                    title="Delivered & Consignment Signed",
-                    location=f"Recipient Destination ({dest_city})",
-                    time=f"Delivered {date_str}" if is_delivered else f"Estimated {date_str} Afternoon",
+                    title=f"5. Sorted & Stored in Warehouse",
+                    location=f"{dest_city} Station Store {f'(Storage Bin: {bin_code})' if bin_code else ''}",
+                    time=arr_dt if m5_done else "Pending Binning",
                     description=(
-                        f"Consignment successfully delivered and signed by {recipient}."
-                        if is_delivered
-                        else f"Queued for last-mile delivery dispatch to {recipient}."
+                        f"Cargo transferred and safely binned at storage location {bin_code} by Warehouse Staff."
+                        if bin_code
+                        else (
+                            f"Freight received in store. Warehouse staff scanning and assigning to storage bin."
+                            if m4_done
+                            else f"Will be placed into storage bin upon train arrival."
+                        )
                     ),
-                    completed=is_delivered,
-                    active=is_delivered or row["raw_status"] in ("OUT_FOR_DELIVERY", "IN_TRANSIT_LAST_MILE")
-                )
+                    completed=m5_done,
+                    active=m5_active
+                ),
+                MilestoneSchema(
+                    title=f"6. Out for Delivery via Road Fleet",
+                    location=f"{dest_city} Regional Fleet Dispatch",
+                    time="Dispatched" if m6_done else "Scheduled Dispatch",
+                    description=(
+                        f"Dispatched on Truck {truck_display_plate} (Driver: {driver_display_name}, Assistant: {deliv_row.get('assistant_name', 'Crew')}). Out for doorstep delivery."
+                        if deliv_row
+                        else f"Planned for road delivery dispatch once scheduled by Regional Dispatcher."
+                    ),
+                    completed=m6_done,
+                    active=m6_active
+                ),
+                MilestoneSchema(
+                    title="7. Delivered to Destination by Driver",
+                    location=f"Recipient Destination ({dest_city})",
+                    time=deliv_row["delivered_at"].strftime("%b %d, %I:%M %p") if (deliv_row and deliv_row.get("delivered_at")) else ("Delivered" if m7_done else f"Estimated {date_str} Afternoon"),
+                    description=(
+                        f"Delivered to recipient by {driver_display_name}. Proof note: {deliv_row.get('proof_reference') or 'Handed over to customer'}."
+                        if m7_done
+                        else f"Delivery en route to recipient: {recipient}."
+                    ),
+                    completed=m7_done,
+                    active=m7_active
+                ),
+                MilestoneSchema(
+                    title="8. Receipt Confirmed by Recipient",
+                    location=f"Recipient Destination ({dest_city})",
+                    time="Completed" if m8_done else "Pending Recipient Sign-off",
+                    description=(
+                        "Customer has verified and confirmed order receipt. Consignment workflow successfully completed!"
+                        if m8_done
+                        else "Recipient verification pending. Customer can confirm receipt once package arrives."
+                    ),
+                    completed=m8_done,
+                    active=m8_active
+                ),
             ]
 
             return OrderTrackingResponse(
@@ -447,56 +624,102 @@ def get_order_tracking(tracking_id: str,
                 cargo=cargo,
                 weight=weight,
                 date=date_str,
-                status="delivered" if is_delivered else ("arrived" if is_arrived else norm_status),
+                status="completed" if is_completed else ("delivered" if is_delivered else ("transit" if is_out_for_delivery else ("arrived" if (is_arrived or is_stored) else norm_status))),
                 trainSlot=train_slot,
                 recipient=recipient,
                 amount=amount,
-                milestones=milestones
+                milestones=milestones,
+                raw_status=raw_st,
+                can_confirm_receipt=(raw_st == "DELIVERED"),
+                driver_name=deliv_row["driver_name"] if deliv_row else None,
+                driver_phone=deliv_row["driver_email"] if deliv_row else None,
+                truck_plate=deliv_row["plate_number"] if deliv_row else None,
+                warehouse_bin=bin_code,
+                proof_reference=deliv_row["proof_reference"] if deliv_row else None,
+                delivered_at=deliv_row["delivered_at"].strftime("%b %d, %I:%M %p") if (deliv_row and deliv_row.get("delivered_at")) else None
             )
 
 
-@router.get("/routes")
-def get_available_routes(hub: Optional[str] = None):
-    """Return available delivery routes, optionally filtered by destination hub or city."""
+@router.post("/{order_id}/deliver")
+def mark_order_delivered(
+    order_id: int,
+    payload: DeliverOrderRequest = DeliverOrderRequest(),
+    current_user: dict = Depends(require_roles(["DRIVER", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
+):
+    """Driver marks order as delivered to customer doorstep."""
     with get_db() as conn:
         with conn.cursor() as cursor:
-            city_filter = None
-            if hub:
-                hub_key = hub.strip().upper()
-                hub_info = HUB_CODE_MAP.get(hub_key)
-                if not hub_info:
-                    for k, v in HUB_CODE_MAP.items():
-                        if v["name"].lower() == hub.lower():
-                            hub_info = v
-                            break
-                if hub_info:
-                    city_filter = hub_info["city"]
-                else:
-                    city_filter = hub
+            cursor.execute("SELECT order_id, customer_id, status FROM customer_order WHERE order_id = %s", (order_id,))
+            order = cursor.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
 
-            if city_filter:
+            now = datetime.datetime.now()
+            cursor.execute("UPDATE customer_order SET status = 'DELIVERED' WHERE order_id = %s", (order_id,))
+            cursor.execute("""
+                INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
+                VALUES ('DELIVERED', %s, %s, %s)
+            """, (order_id, current_user["user_id"], now))
+
+            cursor.execute("""
+                UPDATE delivery 
+                SET delivery_status = 'DELIVERED', delivered_at = %s, proof_reference = %s
+                WHERE order_id = %s AND delivery_status <> 'CANCELLED'
+            """, (now, payload.proof_reference or "Handed over to recipient, signed.", order_id))
+
+            # Notify customer
+            cursor.execute("SELECT u.email, u.user_id FROM customer c JOIN `user` u ON u.user_id = c.user_id WHERE c.customer_id = %s", (order["customer_id"],))
+            cust_u = cursor.fetchone()
+            if cust_u:
                 cursor.execute("""
-                    SELECT dr.route_id, dr.route_name, dr.station_id, dr.max_delivery_time,
-                           ss.city, ss.address AS station_address
-                    FROM delivery_route dr
-                    JOIN station_store ss ON ss.station_id = dr.station_id
-                    WHERE LOWER(ss.city) = LOWER(%s) AND ss.is_active = 1
-                    ORDER BY dr.route_id
-                """, (city_filter,))
-            else:
-                cursor.execute("""
-                    SELECT dr.route_id, dr.route_name, dr.station_id, dr.max_delivery_time,
-                           ss.city, ss.address AS station_address
-                    FROM delivery_route dr
-                    JOIN station_store ss ON ss.station_id = dr.station_id
-                    WHERE ss.is_active = 1
-                    ORDER BY ss.city, dr.route_id
-                """)
-            routes = cursor.fetchall()
-            for r in routes:
-                if "max_delivery_time" in r and isinstance(r["max_delivery_time"], datetime.timedelta):
-                    r["max_delivery_time"] = str(r["max_delivery_time"])
-            return routes
+                    INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                    VALUES (%s, %s, 'DELIVERY_UPDATE', 'Consignment Delivered to Doorstep', %s, %s, 0, %s)
+                """, (
+                    cust_u["user_id"], cust_u["email"],
+                    f"Your order #{order_id} has been delivered. Please inspect and confirm receipt.",
+                    order_id, now
+                ))
+
+            conn.commit()
+            return {"status": "SUCCESS", "message": f"Order #{order_id} marked as DELIVERED.", "order_id": order_id}
+
+
+@router.post("/{order_id}/confirm-received")
+def confirm_order_received(
+    order_id: int,
+    payload: ConfirmReceiptRequest = ConfirmReceiptRequest(),
+    current_user: dict = Depends(require_roles(["CUSTOMER", "SUPERADMIN"]))
+):
+    """Customer verifies and confirms order was received."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT order_id, customer_id, status FROM customer_order WHERE order_id = %s", (order_id,))
+            order = cursor.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
+
+            if current_user["role"] == "CUSTOMER":
+                cursor.execute("SELECT customer_id FROM customer WHERE user_id = %s", (current_user["user_id"],))
+                cust = cursor.fetchone()
+                if not cust or cust["customer_id"] != order["customer_id"]:
+                    raise HTTPException(status_code=403, detail="FORBIDDEN: You can only confirm receipt of your own orders.")
+
+            now = datetime.datetime.now()
+            cursor.execute("UPDATE customer_order SET status = 'COMPLETED' WHERE order_id = %s", (order_id,))
+            cursor.execute("""
+                INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
+                VALUES ('COMPLETED', %s, %s, %s)
+            """, (order_id, current_user["user_id"], now))
+
+            notes_text = f" | Customer verified receipt: {payload.notes}" if payload.notes else " | Customer verified receipt"
+            cursor.execute("""
+                UPDATE delivery 
+                SET proof_reference = CONCAT(COALESCE(proof_reference, 'Delivered'), %s)
+                WHERE order_id = %s AND delivery_status <> 'CANCELLED'
+            """, (notes_text, order_id))
+
+            conn.commit()
+            return {"status": "SUCCESS", "message": f"Order #{order_id} receipt confirmed by recipient. Order COMPLETED.", "order_id": order_id}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

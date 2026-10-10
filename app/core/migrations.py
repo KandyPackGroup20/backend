@@ -281,6 +281,29 @@ def run_migrations():
                 except Exception as e:
                     logger.warning(f"Could not seed delivery routes: {e}")
 
+                # 5c. Ensure delivery table has cargo_weight_kg, assigned_at, assigned_by, active_order_id
+                cur.execute("SHOW TABLES LIKE 'delivery'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("cargo_weight_kg", "DECIMAL(14,2) NOT NULL DEFAULT 0.00"),
+                        ("assigned_at", "DATETIME NULL DEFAULT CURRENT_TIMESTAMP"),
+                        ("assigned_by", "INT NULL"),
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM delivery LIKE '{col}'")
+                            if not cur.fetchone():
+                                cur.execute(f"ALTER TABLE delivery ADD COLUMN {col} {defn}")
+                                logger.info(f"Added column '{col}' to delivery.")
+                        except Exception as e:
+                            logger.warning(f"Error checking/adding column {col} to delivery: {e}")
+                    try:
+                        cur.execute("SHOW COLUMNS FROM delivery LIKE 'active_order_id'")
+                        if not cur.fetchone():
+                            cur.execute("ALTER TABLE delivery ADD COLUMN active_order_id INT GENERATED ALWAYS AS (CASE WHEN delivery_status = 'CANCELLED' THEN NULL ELSE order_id END) STORED")
+                            cur.execute("ALTER TABLE delivery ADD CONSTRAINT uq_delivery_active_order UNIQUE (active_order_id)")
+                    except Exception as e:
+                        pass
+
                 # 6. Ensure Core Database Views
                 # View 1: v_trip_capacity_usage (Feature 4.2 / Rail schedules & analytics)
                 try:
@@ -1235,6 +1258,233 @@ def run_migrations():
                     logger.info("[DATABASE AUTO-MIGRATION] Multi-station train trips and manifests verified.")
                 except Exception as e:
                     logger.warning(f"[DATABASE AUTO-MIGRATION] Warning backfilling manifests/trips: {e}")
+
+                # 10. Regional Station assignments for staff and trucks
+                try:
+                    cur.execute("SHOW COLUMNS FROM `user` LIKE 'station_id'")
+                    if not cur.fetchone():
+                        cur.execute("ALTER TABLE `user` ADD COLUMN station_id INT NULL")
+                        logger.info("[DATABASE AUTO-MIGRATION] Added station_id column to user table.")
+
+                    cur.execute("SHOW COLUMNS FROM `truck` LIKE 'station_id'")
+                    if not cur.fetchone():
+                        cur.execute("ALTER TABLE `truck` ADD COLUMN station_id INT NULL")
+                        logger.info("[DATABASE AUTO-MIGRATION] Added station_id column to truck table.")
+
+                    cur.execute("SHOW COLUMNS FROM `truck` LIKE 'capacity_unit'")
+                    if not cur.fetchone():
+                        cur.execute("ALTER TABLE `truck` ADD COLUMN capacity_unit VARCHAR(16) NULL DEFAULT 'KG'")
+                        cur.execute("UPDATE `truck` SET capacity_unit = 'KG' WHERE capacity_unit IS NULL")
+                        logger.info("[DATABASE AUTO-MIGRATION] Added capacity_unit column to truck table.")
+
+                    # Backfill Store Managers from station_store.manager_id
+                    cur.execute("""
+                        UPDATE `user` u
+                        JOIN station_store ss ON ss.manager_id = u.user_id
+                        SET u.station_id = ss.station_id
+                        WHERE u.station_id IS NULL;
+                    """)
+
+                    # Backfill staff based on email keywords
+                    email_station_map = {
+                        "colombo": 1,
+                        "negombo": 2,
+                        "galle": 3,
+                        "matara": 4,
+                        "jaffna": 5,
+                        "trinco": 6,
+                        ".kandy@": 7,
+                    }
+                    for kw, sid in email_station_map.items():
+                        cur.execute(f"UPDATE `user` SET station_id = {sid} WHERE station_id IS NULL AND LOWER(email) LIKE '%{kw}%';")
+
+                    # Default existing seed accounts
+                    cur.execute("UPDATE `user` SET station_id = NULL WHERE email IN ('admin@kandypack.lk', 'logistics@kandypack.lk');")
+                    cur.execute("UPDATE `user` SET station_id = 1 WHERE email IN ('dispatch@kandypack.lk', 'wh.staff1@kandypack.lk', 'driver1@kandypack.lk', 'assistant1@kandypack.lk');")
+                    cur.execute("UPDATE `user` SET station_id = 2 WHERE email IN ('driver2@kandypack.lk', 'assistant2@kandypack.lk');")
+                    cur.execute("UPDATE `user` SET station_id = 3 WHERE email IN ('driver3@kandypack.lk', 'assistant3@kandypack.lk');")
+
+                    # Backfill trucks:
+                    # WP-CAB-1001 -> 1 (Colombo), WP-CAB-1002 -> 2 (Negombo), SP-CAB-2001 -> 3 (Galle)
+                    cur.execute("UPDATE truck SET station_id = 1 WHERE plate_number = 'WP-CAB-1001' AND station_id IS NULL;")
+                    cur.execute("UPDATE truck SET station_id = 2 WHERE plate_number = 'WP-CAB-1002' AND station_id IS NULL;")
+                    cur.execute("UPDATE truck SET station_id = 3 WHERE plate_number = 'SP-CAB-2001' AND station_id IS NULL;")
+
+                    # Seed regional accounts if missing: Galle Dispatcher & Warehouse Staff
+                    pw_hash = '$2b$12$uMfUt5YFlbcW6WOAjOC6Lua9GaZW8CkAI9pNQ4zw5pRvmh3Q8XJrW' # password123
+                    cur.execute("UPDATE `user` SET password_hash = %s WHERE password_hash = '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeg6Lruj3vjPGga31lW';", (pw_hash,))
+                    cur.execute("""
+                        UPDATE `user` SET force_password_reset = 0, password_hash = %s 
+                        WHERE email IN (
+                            'admin@kandypack.lk', 'logistics@kandypack.lk', 'store.galle@kandypack.lk',
+                            'wh.galle@kandypack.lk', 'dispatch.galle@kandypack.lk', 'driver3@kandypack.lk',
+                            'assistant3@kandypack.lk', 'customer1@gmail.com'
+                        );
+                    """, (pw_hash,))
+                    regional_staff = [
+                        ('Dharshana Galle Dispatcher', 'DISPATCHER', 'dispatch.galle@kandypack.lk', 3),
+                        ('Nuwan Galle Warehouse Staff', 'WAREHOUSE_STAFF', 'wh.galle@kandypack.lk', 3),
+                        ('Saman Colombo Warehouse Staff', 'WAREHOUSE_STAFF', 'wh.colombo@kandypack.lk', 1),
+                        ('Prasanna Negombo Dispatcher', 'DISPATCHER', 'dispatch.negombo@kandypack.lk', 2),
+                        ('Rohana Negombo Warehouse Staff', 'WAREHOUSE_STAFF', 'wh.negombo@kandypack.lk', 2),
+                    ]
+                    for name, role, email, sid in regional_staff:
+                        cur.execute("SELECT user_id FROM `user` WHERE email = %s", (email,))
+                        if not cur.fetchone():
+                            cur.execute("""
+                                INSERT INTO `user` (name, role, email, password_hash, force_password_reset, is_active, station_id)
+                                VALUES (%s, %s, %s, %s, 0, 1, %s)
+                            """, (name, role, email, pw_hash, sid))
+
+                    # Inventory & Manifest Schema Harmonization
+                    try:
+                        cur.execute("ALTER TABLE inventory MODIFY COLUMN order_item_id INT NULL;")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE inventory MODIFY COLUMN manifest_id INT NULL;")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE inventory ADD CONSTRAINT uq_inventory_station_product UNIQUE (station_id, product_id);")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("""
+                            DELETE m1 FROM manifest m1
+                            INNER JOIN manifest m2 
+                            WHERE m1.manifest_id > m2.manifest_id 
+                              AND m1.station_id = m2.station_id 
+                              AND m1.trip_id = m2.trip_id;
+                        """)
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE manifest ADD CONSTRAINT uq_manifest_station_trip UNIQUE (station_id, trip_id);")
+                    except Exception:
+                        pass
+
+                    # Recreate sp_receive_manifest to ensure robust manifest locking and stock addition
+                    try:
+                        cur.execute("DROP PROCEDURE IF EXISTS sp_receive_manifest;")
+                        cur.execute("""
+                            CREATE PROCEDURE sp_receive_manifest(
+                                IN p_station_id INT,
+                                IN p_trip_id INT,
+                                IN p_user_id INT,
+                                OUT p_result_code VARCHAR(50)
+                            )
+                            PROC_BODY: BEGIN
+                                DECLARE v_manifest_id INT DEFAULT NULL;
+                                DECLARE v_manifest_status VARCHAR(50) DEFAULT NULL;
+
+                                DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                                BEGIN
+                                    ROLLBACK;
+                                    SET p_result_code = 'ERROR_TRANSACTION_FAILED';
+                                END;
+
+                                START TRANSACTION;
+
+                                -- 1. Lock and validate manifest (limit 1 avoids multi-row crash)
+                                SELECT manifest_id, status INTO v_manifest_id, v_manifest_status
+                                FROM manifest
+                                WHERE station_id = p_station_id AND trip_id = p_trip_id
+                                LIMIT 1
+                                FOR UPDATE;
+
+                                IF v_manifest_id IS NULL THEN
+                                    ROLLBACK;
+                                    SET p_result_code = 'MANIFEST_NOT_FOUND';
+                                    LEAVE PROC_BODY;
+                                END IF;
+
+                                IF v_manifest_status <> 'PENDING' THEN
+                                    ROLLBACK;
+                                    SET p_result_code = 'MANIFEST_ALREADY_RECEIVED';
+                                    LEAVE PROC_BODY;
+                                END IF;
+
+                                -- 2. Add allocated stock to destination station inventory
+                                add_stock: BEGIN
+                                    DECLARE v_order_item_id INT;
+                                    DECLARE v_product_id INT;
+                                    DECLARE v_qty INT;
+                                    DECLARE done INT DEFAULT FALSE;
+
+                                    DECLARE cur_items CURSOR FOR
+                                        SELECT oi.order_item_id, oi.product_id, ra.allocated_quantity
+                                        FROM rail_allocation ra
+                                        JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                                        WHERE ra.trip_id = p_trip_id;
+                                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+
+                                    OPEN cur_items;
+                                    item_loop: LOOP
+                                        FETCH cur_items INTO v_order_item_id, v_product_id, v_qty;
+                                        IF done THEN LEAVE item_loop; END IF;
+
+                                        INSERT INTO inventory (manifest_id, order_item_id, station_id, product_id, stored_quantity)
+                                        VALUES (v_manifest_id, v_order_item_id, p_station_id, v_product_id, v_qty)
+                                        ON DUPLICATE KEY UPDATE stored_quantity = stored_quantity + v_qty;
+                                    END LOOP;
+                                    CLOSE cur_items;
+                                END add_stock;
+
+                                -- 3. Mark manifest as RECEIVED
+                                UPDATE manifest
+                                SET status = 'RECEIVED', received_at = NOW()
+                                WHERE station_id = p_station_id AND trip_id = p_trip_id;
+
+                                -- 4. Advance orders whose trips are now all received
+                                advance_orders: BEGIN
+                                    DECLARE v_order_id INT;
+                                    DECLARE v_remaining_trips INT;
+                                    DECLARE done2 INT DEFAULT FALSE;
+
+                                    DECLARE cur_orders CURSOR FOR
+                                        SELECT DISTINCT oi.order_id
+                                        FROM rail_allocation ra
+                                        JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                                        WHERE ra.trip_id = p_trip_id;
+                                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done2 = TRUE;
+
+                                    OPEN cur_orders;
+                                    order_loop: LOOP
+                                        FETCH cur_orders INTO v_order_id;
+                                        IF done2 THEN LEAVE order_loop; END IF;
+
+                                        SELECT COUNT(*) INTO v_remaining_trips
+                                        FROM rail_allocation ra2
+                                        JOIN order_item oi2 ON ra2.order_item_id = oi2.order_item_id
+                                        JOIN train_trip tt2 ON ra2.trip_id = tt2.trip_id
+                                        LEFT JOIN manifest m2 ON m2.trip_id = tt2.trip_id AND m2.station_id = tt2.destination_station_id
+                                        WHERE oi2.order_id = v_order_id
+                                          AND (m2.status IS NULL OR m2.status <> 'RECEIVED');
+
+                                        IF v_remaining_trips = 0 THEN
+                                            UPDATE customer_order
+                                            SET status = 'ARRIVED_AT_STATION_STORE'
+                                            WHERE order_id = v_order_id;
+
+                                            INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
+                                            VALUES ('ARRIVED_AT_STATION_STORE', v_order_id, p_user_id, NOW());
+                                        END IF;
+                                    END LOOP;
+                                    CLOSE cur_orders;
+                                END advance_orders;
+
+                                COMMIT;
+                                SET p_result_code = 'SUCCESS';
+                            END;
+                        """)
+                    except Exception as sp_err:
+                        logger.warning(f"Error redefining sp_receive_manifest: {sp_err}")
+
+                    conn.commit()
+                    logger.info("[DATABASE AUTO-MIGRATION] Regional station assignments and staff verified.")
+                except Exception as reg_err:
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning applying regional station migration: {reg_err}")
 
                 conn.commit()
                 logger.info("[DATABASE AUTO-MIGRATION] All schema verifications and views created successfully.")

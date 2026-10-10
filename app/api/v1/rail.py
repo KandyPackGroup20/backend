@@ -6,9 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator
 import pymysql
 
+import logging
 from app.core.database import get_db
 from app.core.security import require_roles
 from app.core.cache import get_cache, set_cache, invalidate_cache
+from app.core.notifications import log_and_dispatch_email
+
+logger = logging.getLogger("kandypack.rail")
 
 router = APIRouter(prefix="/rail", tags=["Rail Allocation & Schedules (Feature 4.2)"])
 
@@ -590,12 +594,16 @@ def allocate_rail_capacity(
             return _allocate_rail_capacity(payload, current_user)
         except pymysql.MySQLError as error:
             code = error.args[0] if error.args else None
+            logger.exception(f"Rail allocation attempt {attempt + 1} database error: {error}")
             if code in (1205, 1213) and attempt < 2:
                 continue
             if code in (1205, 1213):
                 raise HTTPException(status_code=503, detail="DEADLOCK_RETRY: Please retry allocation.")
-            raise HTTPException(status_code=400 if code == 1644 else 503,
-                                detail="Allocation could not be completed. Refresh the order and trip state before retrying.")
+            err_msg = error.args[1] if len(error.args) > 1 else str(error)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Allocation database error: {err_msg}"
+            )
 
 
 def _allocate_rail_capacity(payload: RailAllocateRequest, current_user: dict):
@@ -606,8 +614,10 @@ def _allocate_rail_capacity(payload: RailAllocateRequest, current_user: dict):
             if payload.trip_id:
                 # Use the same lock order as the automatic scheduler: order, then trip.
                 cursor.execute(
-                    """SELECT co.status, co.delivery_date, dr.station_id AS dest_station_id
-                       FROM customer_order co JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                    """SELECT co.status, co.delivery_date, dr.station_id AS dest_station_id, ss.city AS dest_city
+                       FROM customer_order co 
+                       JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                       JOIN station_store ss ON ss.station_id = dr.station_id
                        WHERE co.order_id = %s FOR UPDATE""", (payload.order_id,)
                 )
                 order = cursor.fetchone()
@@ -675,10 +685,93 @@ def _allocate_rail_capacity(payload: RailAllocateRequest, current_user: dict):
 
                 if not status_code.startswith("SUCCESS"):
                     conn.rollback()
+                    if status_code == "INSUFFICIENT_RAIL_CAPACITY":
+                        cursor.execute(
+                            """SELECT co.delivery_date, ss.city
+                               FROM customer_order co
+                               JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                               JOIN station_store ss ON ss.station_id = dr.station_id
+                               WHERE co.order_id = %s""",
+                            (payload.order_id,)
+                        )
+                        ord_meta = cursor.fetchone()
+                        dest_c = ord_meta["city"] if ord_meta else "destination"
+                        cut_d = str(ord_meta["delivery_date"]) if ord_meta else "delivery deadline"
+                        detail = f"INSUFFICIENT_RAIL_CAPACITY: No scheduled train trips departing Kandy for {dest_c} Hub have available capacity before the delivery cutoff date ({cut_d}). Please schedule a new train trip arriving on or before {cut_d}."
+                    else:
+                        detail = f"Rail allocation failed: {status_code}"
                     raise HTTPException(
-                        status_code=RESULT_HTTP_STATUS.get(status_code, 500),
-                        detail=f"Rail allocation failed: {status_code}",
+                        status_code=RESULT_HTTP_STATUS.get(status_code, 400),
+                        detail=detail,
                     )
+
+            # Ensure pending manifest exists for all trips in this order's allocation
+            cursor.execute(
+                """
+                INSERT INTO manifest (station_id, trip_id, status)
+                SELECT DISTINCT tt.destination_station_id, tt.trip_id, 'PENDING'
+                FROM rail_allocation ra
+                JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                JOIN train_trip tt ON ra.trip_id = tt.trip_id
+                WHERE oi.order_id = %s
+                ON DUPLICATE KEY UPDATE manifest_id = manifest_id
+                """,
+                (payload.order_id,)
+            )
+
+            # Resolve destination Store Manager to notify them
+            cursor.execute(
+                """
+                SELECT DISTINCT ss.station_id, ss.city, u.user_id AS manager_id, u.email AS manager_email, u.name AS manager_name
+                FROM customer_order co
+                JOIN delivery_route dr ON co.delivery_route_id = dr.route_id
+                JOIN station_store ss ON dr.station_id = ss.station_id
+                LEFT JOIN user u ON (u.user_id = ss.manager_id OR (u.role = 'STORE_MGR' AND u.email LIKE CONCAT('%', LOWER(ss.city), '%')))
+                WHERE co.order_id = %s
+                ORDER BY u.user_id DESC
+                LIMIT 1
+                """,
+                (payload.order_id,)
+            )
+            dest_mgr = cursor.fetchone()
+
+            if dest_mgr and dest_mgr.get("manager_email"):
+                # Query allocated trips details
+                cursor.execute(
+                    """
+                    SELECT DISTINCT tt.trip_id, tt.departure_datetime, tt.arrival_datetime
+                    FROM rail_allocation ra
+                    JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                    JOIN train_trip tt ON ra.trip_id = tt.trip_id
+                    WHERE oi.order_id = %s
+                    ORDER BY tt.departure_datetime ASC
+                    """,
+                    (payload.order_id,)
+                )
+                allocated_trips = cursor.fetchall()
+                trip_summary = ", ".join([f"Trip #{t['trip_id']} (Dep: {t['departure_datetime']}, Arr: {t['arrival_datetime']})" for t in allocated_trips])
+
+                notif_title = f"Incoming Rail Consignment: Order #{payload.order_id}"
+                notif_msg = (
+                    f"Order #{payload.order_id} has been scheduled for rail transport to {dest_mgr['city']} Hub via {trip_summary}. "
+                    f"Please inspect cargo and confirm receipt upon arrival at the station store."
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                    VALUES (%s, %s, 'NEW_CONSIGNMENT', %s, %s, %s, 0, NOW())
+                    """,
+                    (dest_mgr.get("manager_id"), dest_mgr["manager_email"], notif_title, notif_msg, payload.order_id)
+                )
+
+                try:
+                    log_and_dispatch_email(
+                        recipient_email=dest_mgr["manager_email"],
+                        subject=f"[KandyPack] Incoming Rail Freight - Order #{payload.order_id}",
+                        body=f"Hello {dest_mgr.get('manager_name', 'Store Manager')},\n\nOrder #{payload.order_id} has been scheduled for rail transit to {dest_mgr['city']} Hub.\nAllocated Trains: {trip_summary}\n\nPlease verify cargo and confirm arrival once received at the station store.\n\nKandyPack Rail Logistics Operations"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not dispatch email to Store Manager: {e}")
 
             conn.commit()
             invalidate_cache("cache:rail:")

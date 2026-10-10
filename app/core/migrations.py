@@ -464,6 +464,593 @@ def run_migrations():
                 except Exception as e:
                     pass
 
+                # 7. Ensure All Station Store Managers exist
+                try:
+                    default_pw_hash = '$2b$12$vZdokKakUJDbss6pql2eouY6R71UscldmnVEiJTCPfhOrL3DpEa6e'
+                    store_mgrs = [
+                        (4, 'Sunil Colombo Store Mgr', 'store.colombo@kandypack.lk', 1),
+                        (13, 'Roshan Negombo Store Mgr', 'store.negombo@kandypack.lk', 2),
+                        (14, 'Chaminda Galle Store Mgr', 'store.galle@kandypack.lk', 3),
+                        (15, 'Ishara Matara Store Mgr', 'store.matara@kandypack.lk', 4),
+                        (16, 'Vithursan Jaffna Store Mgr', 'store.jaffna@kandypack.lk', 5),
+                        (17, 'Nadeesha Trinco Store Mgr', 'store.trinco@kandypack.lk', 6),
+                        (18, 'Ajith Kandy Store Mgr', 'store.kandy@kandypack.lk', 7),
+                    ]
+                    for uid, name, email, st_id in store_mgrs:
+                        cur.execute("SELECT user_id FROM user WHERE email = %s", (email,))
+                        existing_u = cur.fetchone()
+                        if not existing_u:
+                            cur.execute(
+                                """INSERT INTO user (user_id, name, role, email, password_hash, is_active, force_password_reset)
+                                   VALUES (%s, %s, 'STORE_MGR', %s, %s, 1, 0)
+                                   ON DUPLICATE KEY UPDATE name=VALUES(name), role=VALUES(role), is_active=1""",
+                                (uid, name, email, default_pw_hash)
+                            )
+                            target_uid = uid
+                        else:
+                            target_uid = existing_u["user_id"]
+
+                        # Link to station_store
+                        cur.execute("UPDATE station_store SET manager_id = %s WHERE station_id = %s", (target_uid, st_id))
+                    logger.info("[DATABASE AUTO-MIGRATION] Station store managers verified and linked.")
+                except Exception as e:
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning seeding store managers: {e}")
+
+                # 8. Ensure Stored Functions
+                try:
+                    cur.execute("DROP FUNCTION IF EXISTS fn_order_item_space")
+                    cur.execute("""
+                        CREATE FUNCTION fn_order_item_space(p_order_item_id INT, p_quantity INT)
+                        RETURNS DECIMAL(10,2)
+                        READS SQL DATA
+                        BEGIN
+                          DECLARE v_rate DECIMAL(6,4);
+                          DECLARE v_qty  INT;
+
+                          SELECT p.space_consumption_rate, COALESCE(p_quantity, oi.quantity)
+                            INTO v_rate, v_qty
+                            FROM order_item oi
+                            JOIN product p ON p.product_id = oi.product_id
+                           WHERE oi.order_item_id = p_order_item_id;
+
+                          IF v_rate IS NULL THEN
+                            RETURN NULL;
+                          END IF;
+
+                          RETURN CEILING(v_qty * v_rate * 100) / 100;
+                        END
+                    """)
+
+                    cur.execute("DROP FUNCTION IF EXISTS fn_trip_remaining_capacity")
+                    cur.execute("""
+                        CREATE FUNCTION fn_trip_remaining_capacity(p_trip_id INT)
+                        RETURNS DECIMAL(10,2)
+                        READS SQL DATA
+                        BEGIN
+                          DECLARE v_cap  DECIMAL(10,2);
+                          DECLARE v_used DECIMAL(10,2);
+
+                          SELECT total_capacity INTO v_cap FROM train_trip WHERE trip_id = p_trip_id;
+                          IF v_cap IS NULL THEN
+                            RETURN NULL;
+                          END IF;
+
+                          SELECT COALESCE(SUM(allocated_space), 0) INTO v_used
+                            FROM rail_allocation WHERE trip_id = p_trip_id;
+
+                          RETURN v_cap - v_used;
+                        END
+                    """)
+                    logger.info("[DATABASE AUTO-MIGRATION] Stored functions created.")
+                except Exception as e:
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning creating stored functions: {e}")
+
+                # 9. Ensure Stored Procedures
+                try:
+                    # 9a. sp_schedule_train_order
+                    cur.execute("DROP PROCEDURE IF EXISTS sp_schedule_train_order")
+                    cur.execute("""
+                        CREATE PROCEDURE sp_schedule_train_order(
+                          IN  p_order_id INT,
+                          IN  p_user_id  INT,
+                          OUT p_result   VARCHAR(50)
+                        )
+                        proc_body: BEGIN
+                          DECLARE v_status        VARCHAR(50);
+                          DECLARE v_delivery_date DATE;
+                          DECLARE v_dest_station  INT;
+                          DECLARE v_kandy_station INT;
+                          DECLARE v_item_id       INT DEFAULT 0;
+                          DECLARE v_next_item     INT;
+                          DECLARE v_item_qty      INT;
+                          DECLARE v_rate          DECIMAL(6,4);
+                          DECLARE v_remaining     INT;
+                          DECLARE v_last_dep      DATETIME;
+                          DECLARE v_last_trip     INT;
+                          DECLARE v_trip_id       INT;
+                          DECLARE v_trip_dep      DATETIME;
+                          DECLARE v_trip_cap      DECIMAL(10,2);
+                          DECLARE v_used          DECIMAL(10,2);
+                          DECLARE v_fit           INT;
+                          DECLARE v_alloc_qty     INT;
+                          DECLARE v_trip_count    INT DEFAULT 0;
+                          DECLARE v_any_item      INT DEFAULT 0;
+
+                          DECLARE EXIT HANDLER FOR 1213, 1205
+                          BEGIN
+                            ROLLBACK;
+                            SET p_result = 'DEADLOCK_RETRY';
+                          END;
+
+                          DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                          BEGIN
+                            ROLLBACK;
+                            SET p_result = 'ERROR_TRANSACTION_FAILED';
+                            IF p_user_id IS NOT NULL THEN
+                              INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                              VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, 'ERROR_TRANSACTION_FAILED', 'customer_order');
+                              COMMIT;
+                            END IF;
+                          END;
+
+                          START TRANSACTION;
+
+                          SET v_status = NULL;
+                          SELECT status, delivery_date INTO v_status, v_delivery_date
+                            FROM customer_order WHERE order_id = p_order_id FOR UPDATE;
+
+                          IF v_status IS NULL THEN
+                            ROLLBACK; SET p_result = 'ORDER_NOT_FOUND';
+                            IF p_user_id IS NOT NULL THEN
+                              INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                              VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                              COMMIT;
+                            END IF;
+                            LEAVE proc_body;
+                          END IF;
+
+                          IF v_status <> 'PENDING_RAIL_SCHEDULING' THEN
+                            ROLLBACK; SET p_result = 'INVALID_ORDER_STATUS';
+                            IF p_user_id IS NOT NULL THEN
+                              INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                              VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                              COMMIT;
+                            END IF;
+                            LEAVE proc_body;
+                          END IF;
+
+                          SET v_dest_station = NULL;
+                          SELECT dr.station_id INTO v_dest_station
+                            FROM customer_order co
+                            JOIN customer c        ON c.customer_id = co.customer_id
+                            JOIN delivery_route dr ON dr.route_id   = co.delivery_route_id
+                            JOIN station_store dest ON dest.station_id = dr.station_id AND dest.is_active = 1
+                              AND dest.city IN ('Colombo','Negombo','Galle','Matara','Jaffna','Trincomalee')
+                           WHERE co.order_id = p_order_id;
+
+                          IF v_dest_station IS NULL THEN
+                            ROLLBACK; SET p_result = 'DESTINATION_HUB_NOT_RESOLVED';
+                            IF p_user_id IS NOT NULL THEN
+                              INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                              VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                              COMMIT;
+                            END IF;
+                            LEAVE proc_body;
+                          END IF;
+
+                          SET v_kandy_station = NULL;
+                          SELECT station_id INTO v_kandy_station FROM station_store WHERE city = 'Kandy' AND is_active = 1 ORDER BY station_id LIMIT 1;
+                          IF v_kandy_station IS NULL THEN
+                            ROLLBACK; SET p_result = 'ORIGIN_HUB_NOT_FOUND';
+                            IF p_user_id IS NOT NULL THEN
+                              INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                              VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                              COMMIT;
+                            END IF;
+                            LEAVE proc_body;
+                          END IF;
+
+                          item_loop: LOOP
+                            SET v_next_item = NULL;
+                            SELECT MIN(order_item_id) INTO v_next_item
+                              FROM order_item WHERE order_id = p_order_id AND order_item_id > v_item_id;
+
+                            IF v_next_item IS NULL THEN
+                              LEAVE item_loop;
+                            END IF;
+
+                            SET v_item_id  = v_next_item;
+                            SET v_any_item = 1;
+
+                            SELECT oi.quantity, p.space_consumption_rate INTO v_item_qty, v_rate
+                              FROM order_item oi JOIN product p ON p.product_id = oi.product_id
+                             WHERE oi.order_item_id = v_item_id;
+
+                            IF v_item_qty <= 0 THEN
+                              ROLLBACK; SET p_result = 'INVALID_ORDER_QUANTITY';
+                              LEAVE proc_body;
+                            END IF;
+
+                            IF v_rate IS NULL OR v_rate <= 0 THEN
+                              ROLLBACK; SET p_result = 'INVALID_PRODUCT_SPACE_RATE';
+                              IF p_user_id IS NOT NULL THEN
+                                INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                                COMMIT;
+                              END IF;
+                              LEAVE proc_body;
+                            END IF;
+
+                            SET v_remaining = v_item_qty;
+                            SET v_last_dep  = '1000-01-01 00:00:00';
+                            SET v_last_trip = 0;
+
+                            trip_loop: WHILE v_remaining > 0 DO
+                              SET v_trip_id = NULL;
+
+                              SELECT tt.trip_id, tt.departure_datetime, tt.total_capacity
+                                INTO v_trip_id, v_trip_dep, v_trip_cap
+                                FROM train_trip tt
+                               WHERE tt.origin_station_id = v_kandy_station
+                                 AND tt.destination_station_id = v_dest_station
+                                 AND tt.status = 'SCHEDULED'
+                                 AND NOT EXISTS (SELECT 1 FROM manifest m WHERE m.trip_id=tt.trip_id AND m.status='RECEIVED')
+                                 AND tt.departure_datetime > CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+05:30')
+                                 AND tt.arrival_datetime < v_delivery_date + INTERVAL 1 DAY
+                                 AND (tt.departure_datetime > v_last_dep
+                                      OR (tt.departure_datetime = v_last_dep AND tt.trip_id > v_last_trip))
+                               ORDER BY tt.departure_datetime, tt.trip_id
+                               LIMIT 1
+                               FOR UPDATE;
+
+                              IF v_trip_id IS NULL THEN
+                                LEAVE trip_loop;
+                              END IF;
+
+                              SET v_last_dep  = v_trip_dep;
+                              SET v_last_trip = v_trip_id;
+
+                              SELECT COALESCE(SUM(allocated_space), 0) INTO v_used
+                                FROM rail_allocation WHERE trip_id = v_trip_id FOR UPDATE;
+
+                              SET v_fit = FLOOR((v_trip_cap - v_used) / v_rate);
+
+                              IF v_fit > 0 THEN
+                                SET v_alloc_qty = LEAST(v_fit, v_remaining);
+
+                                INSERT INTO rail_allocation
+                                       (order_item_id, trip_id, allocated_quantity, allocated_space, allocated_by)
+                                VALUES (v_item_id, v_trip_id, v_alloc_qty,
+                                        fn_order_item_space(v_item_id, v_alloc_qty), p_user_id);
+
+                                SET v_remaining = v_remaining - v_alloc_qty;
+                              END IF;
+                            END WHILE trip_loop;
+
+                            IF v_remaining > 0 THEN
+                              ROLLBACK; SET p_result = 'INSUFFICIENT_RAIL_CAPACITY';
+                              IF p_user_id IS NOT NULL THEN
+                                INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                                COMMIT;
+                              END IF;
+                              LEAVE proc_body;
+                            END IF;
+                          END LOOP item_loop;
+
+                          IF v_any_item = 0 THEN
+                            ROLLBACK; SET p_result = 'ORDER_HAS_NO_ITEMS';
+                            IF p_user_id IS NOT NULL THEN
+                              INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                              VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                              COMMIT;
+                            END IF;
+                            LEAVE proc_body;
+                          END IF;
+
+                          SELECT COUNT(DISTINCT ra.trip_id) INTO v_trip_count
+                            FROM rail_allocation ra
+                            JOIN order_item oi ON oi.order_item_id = ra.order_item_id
+                           WHERE oi.order_id = p_order_id;
+
+                          IF v_trip_count = 1 THEN
+                            UPDATE customer_order SET status = 'SCHEDULED_FOR_RAIL' WHERE order_id = p_order_id;
+                            INSERT INTO order_status_history (status, order_id, changed_by)
+                            VALUES ('SCHEDULED_FOR_RAIL', p_order_id, p_user_id);
+                            SET p_result = 'SUCCESS_SINGLE_TRIP';
+                          ELSE
+                            UPDATE customer_order SET status = 'SCHEDULED_MULTI_TRIP' WHERE order_id = p_order_id;
+                            INSERT INTO order_status_history (status, order_id, changed_by)
+                            VALUES ('SCHEDULED_MULTI_TRIP', p_order_id, p_user_id);
+                            SET p_result = 'SUCCESS_MULTI_TRIP_SPILLOVER';
+                          END IF;
+
+                          IF p_user_id IS NOT NULL THEN
+                            INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                            VALUES (p_user_id, 'SCHEDULE_RAIL_ORDER', p_order_id, 'SUCCESS', 'customer_order');
+                          END IF;
+
+                          COMMIT;
+                        END
+                    """)
+
+                    # 9b. sp_reverse_rail_allocation
+                    cur.execute("DROP PROCEDURE IF EXISTS sp_reverse_rail_allocation")
+                    cur.execute("""
+                        CREATE PROCEDURE sp_reverse_rail_allocation(
+                            IN  p_order_id INT,
+                            IN  p_user_id  INT,
+                            OUT p_result   VARCHAR(50)
+                        )
+                        proc_body: BEGIN
+                            DECLARE v_status VARCHAR(50);
+                            DECLARE v_alloc_count INT;
+                            DECLARE v_invalid_trip_count INT;
+                            DECLARE done INT DEFAULT FALSE;
+
+                            DECLARE v_audit_alloc_id INT;
+                            DECLARE v_audit_trip_id INT;
+                            DECLARE v_audit_qty INT;
+                            DECLARE v_audit_space DECIMAL(10,2);
+
+                            DECLARE cur_allocs CURSOR FOR
+                                SELECT ra.allocation_id, ra.trip_id, ra.allocated_quantity, ra.allocated_space
+                                FROM rail_allocation ra
+                                JOIN order_item oi ON oi.order_item_id = ra.order_item_id
+                                WHERE oi.order_id = p_order_id;
+
+                            DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+
+                            DECLARE EXIT HANDLER FOR 1213, 1205
+                            BEGIN
+                                ROLLBACK;
+                                SET p_result = 'DEADLOCK_RETRY';
+                            END;
+
+                            DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                            BEGIN
+                                ROLLBACK;
+                                SET p_result = 'ERROR_TRANSACTION_FAILED';
+                                IF p_user_id IS NOT NULL THEN
+                                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                    VALUES (p_user_id, 'REVERSE_RAIL_ORDER', p_order_id, 'ERROR_TRANSACTION_FAILED', 'customer_order');
+                                    COMMIT;
+                                END IF;
+                            END;
+
+                            START TRANSACTION;
+
+                            SET v_status = NULL;
+                            SELECT status INTO v_status
+                              FROM customer_order
+                             WHERE order_id = p_order_id
+                               FOR UPDATE;
+
+                            IF v_status IS NULL THEN
+                                ROLLBACK;
+                                SET p_result = 'ORDER_NOT_FOUND';
+                                IF p_user_id IS NOT NULL THEN
+                                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                    VALUES (p_user_id, 'REVERSE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                                    COMMIT;
+                                END IF;
+                                LEAVE proc_body;
+                            END IF;
+
+                            IF v_status NOT IN ('SCHEDULED_FOR_RAIL', 'SCHEDULED_MULTI_TRIP') THEN
+                                ROLLBACK;
+                                SET p_result = 'INVALID_ORDER_STATUS';
+                                IF p_user_id IS NOT NULL THEN
+                                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                    VALUES (p_user_id, 'REVERSE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                                    COMMIT;
+                                END IF;
+                                LEAVE proc_body;
+                            END IF;
+
+                            SELECT COUNT(*) INTO v_alloc_count
+                            FROM rail_allocation ra
+                            JOIN order_item oi ON oi.order_item_id = ra.order_item_id
+                            WHERE oi.order_id = p_order_id;
+
+                            IF v_alloc_count = 0 THEN
+                                ROLLBACK;
+                                SET p_result = 'NO_ALLOCATIONS_FOUND';
+                                IF p_user_id IS NOT NULL THEN
+                                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                    VALUES (p_user_id, 'REVERSE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                                    COMMIT;
+                                END IF;
+                                LEAVE proc_body;
+                            END IF;
+
+                            SELECT COUNT(DISTINCT tt.trip_id) INTO v_invalid_trip_count
+                            FROM rail_allocation ra
+                            JOIN order_item oi ON oi.order_item_id = ra.order_item_id
+                            JOIN train_trip tt ON tt.trip_id = ra.trip_id
+                            WHERE oi.order_id = p_order_id
+                              AND (
+                                  tt.status != 'SCHEDULED'
+                                  OR tt.departure_datetime <= CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+05:30')
+                                  OR EXISTS (SELECT 1 FROM manifest m WHERE m.trip_id = tt.trip_id AND m.status = 'RECEIVED')
+                              );
+
+                            IF v_invalid_trip_count > 0 THEN
+                                ROLLBACK;
+                                SET p_result = 'CANNOT_REVERSE_DEPARTED_OR_INACTIVE_TRIP';
+                                IF p_user_id IS NOT NULL THEN
+                                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                    VALUES (p_user_id, 'REVERSE_RAIL_ORDER', p_order_id, p_result, 'customer_order');
+                                    COMMIT;
+                                END IF;
+                                LEAVE proc_body;
+                            END IF;
+
+                            OPEN cur_allocs;
+                            alloc_loop: LOOP
+                                FETCH cur_allocs INTO v_audit_alloc_id, v_audit_trip_id, v_audit_qty, v_audit_space;
+                                IF done THEN
+                                    LEAVE alloc_loop;
+                                END IF;
+
+                                IF p_user_id IS NOT NULL THEN
+                                    INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                    VALUES (p_user_id, 'REVERSE_TRIP_ALLOCATION', v_audit_trip_id,
+                                            CONCAT('RELEASED_QTY_', v_audit_qty, '_SPACE_', v_audit_space), 'rail_allocation');
+                                END IF;
+                            END LOOP alloc_loop;
+                            CLOSE cur_allocs;
+
+                            DELETE ra FROM rail_allocation ra
+                            JOIN order_item oi ON oi.order_item_id = ra.order_item_id
+                            WHERE oi.order_id = p_order_id;
+
+                            UPDATE customer_order
+                            SET status = 'PENDING_RAIL_SCHEDULING'
+                            WHERE order_id = p_order_id;
+
+                            INSERT INTO order_status_history (status, order_id, changed_by)
+                            VALUES ('PENDING_RAIL_SCHEDULING', p_order_id, p_user_id);
+
+                            IF p_user_id IS NOT NULL THEN
+                                INSERT INTO audit_log (user_id, action, entity_id, outcome, entity_name)
+                                VALUES (p_user_id, 'REVERSE_RAIL_ORDER', p_order_id, 'SUCCESS', 'customer_order');
+                            END IF;
+
+                            COMMIT;
+                            SET p_result = 'SUCCESS_REVERSED';
+                        END
+                    """)
+
+                    # 9c. sp_receive_manifest
+                    cur.execute("DROP PROCEDURE IF EXISTS sp_receive_manifest")
+                    cur.execute("""
+                        CREATE PROCEDURE sp_receive_manifest(
+                            IN p_station_id INT,
+                            IN p_trip_id INT,
+                            IN p_user_id INT,
+                            OUT p_result_code VARCHAR(50)
+                        )
+                        PROC_BODY: BEGIN
+                            DECLARE v_manifest_id INT;
+                            DECLARE v_manifest_status VARCHAR(50);
+
+                            DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                            BEGIN
+                                ROLLBACK;
+                                SET p_result_code = 'ERROR_TRANSACTION_FAILED';
+                            END;
+
+                            START TRANSACTION;
+
+                            SELECT manifest_id, status INTO v_manifest_id, v_manifest_status
+                            FROM manifest
+                            WHERE station_id = p_station_id AND trip_id = p_trip_id
+                            FOR UPDATE;
+
+                            IF v_manifest_id IS NULL THEN
+                                ROLLBACK;
+                                SET p_result_code = 'MANIFEST_NOT_FOUND';
+                                LEAVE PROC_BODY;
+                            END IF;
+
+                            IF v_manifest_status <> 'PENDING' THEN
+                                ROLLBACK;
+                                SET p_result_code = 'MANIFEST_ALREADY_RECEIVED';
+                                LEAVE PROC_BODY;
+                            END IF;
+
+                            add_stock: BEGIN
+                                DECLARE v_product_id INT;
+                                DECLARE v_qty INT;
+                                DECLARE done INT DEFAULT FALSE;
+
+                                DECLARE cur_items CURSOR FOR
+                                    SELECT oi.product_id, ra.allocated_quantity
+                                    FROM rail_allocation ra
+                                    JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                                    WHERE ra.trip_id = p_trip_id;
+                                DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+
+                                OPEN cur_items;
+                                item_loop: LOOP
+                                    FETCH cur_items INTO v_product_id, v_qty;
+                                    IF done THEN LEAVE item_loop; END IF;
+
+                                    INSERT INTO inventory (station_id, product_id, stored_quantity)
+                                    VALUES (p_station_id, v_product_id, v_qty)
+                                    ON DUPLICATE KEY UPDATE stored_quantity = stored_quantity + v_qty;
+
+                                END LOOP;
+                                CLOSE cur_items;
+                            END add_stock;
+
+                            UPDATE manifest
+                            SET status = 'RECEIVED', received_at = NOW()
+                            WHERE manifest_id = v_manifest_id;
+
+                            advance_orders: BEGIN
+                                DECLARE v_order_id INT;
+                                DECLARE v_remaining_trips INT;
+                                DECLARE done2 INT DEFAULT FALSE;
+
+                                DECLARE cur_orders CURSOR FOR
+                                    SELECT DISTINCT oi.order_id
+                                    FROM rail_allocation ra
+                                    JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                                    WHERE ra.trip_id = p_trip_id;
+                                DECLARE CONTINUE HANDLER FOR NOT FOUND SET done2 = TRUE;
+
+                                OPEN cur_orders;
+                                order_loop: LOOP
+                                    FETCH cur_orders INTO v_order_id;
+                                    IF done2 THEN LEAVE order_loop; END IF;
+
+                                    SELECT COUNT(*) INTO v_remaining_trips
+                                    FROM rail_allocation ra2
+                                    JOIN order_item oi2 ON ra2.order_item_id = oi2.order_item_id
+                                    JOIN train_trip tt2 ON ra2.trip_id = tt2.trip_id
+                                    LEFT JOIN manifest m2 ON m2.trip_id = tt2.trip_id AND m2.station_id = tt2.destination_station_id
+                                    WHERE oi2.order_id = v_order_id
+                                      AND (m2.status IS NULL OR m2.status <> 'RECEIVED');
+
+                                    IF v_remaining_trips = 0 THEN
+                                        UPDATE customer_order
+                                        SET status = 'ARRIVED_AT_STATION_STORE'
+                                        WHERE order_id = v_order_id;
+
+                                        INSERT INTO order_status_history (status, order_id, changed_by)
+                                        VALUES ('ARRIVED_AT_STATION_STORE', v_order_id, p_user_id);
+                                    END IF;
+
+                                END LOOP;
+                                CLOSE cur_orders;
+                            END advance_orders;
+
+                            COMMIT;
+                            SET p_result_code = 'SUCCESS';
+                        END
+                    """)
+                    logger.info("[DATABASE AUTO-MIGRATION] Stored procedures created.")
+                except Exception as e:
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning creating stored procedures: {e}")
+
+                # 10. Ensure Manifest Trigger
+                try:
+                    cur.execute("DROP TRIGGER IF EXISTS trg_rail_alloc_manifest_ai")
+                    cur.execute("""
+                        CREATE TRIGGER trg_rail_alloc_manifest_ai AFTER INSERT ON rail_allocation
+                        FOR EACH ROW
+                        BEGIN
+                          INSERT INTO manifest (station_id, trip_id, status)
+                          SELECT destination_station_id, trip_id, 'PENDING' FROM train_trip WHERE trip_id=NEW.trip_id
+                          ON DUPLICATE KEY UPDATE manifest_id=manifest_id;
+                        END
+                    """)
+                    logger.info("[DATABASE AUTO-MIGRATION] trg_rail_alloc_manifest_ai trigger created.")
+                except Exception as e:
+                    logger.warning(f"[DATABASE AUTO-MIGRATION] Warning creating trigger: {e}")
+
                 conn.commit()
                 logger.info("[DATABASE AUTO-MIGRATION] All schema verifications and views created successfully.")
                 return True

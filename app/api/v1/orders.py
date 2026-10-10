@@ -34,6 +34,8 @@ def normalize_status(raw: str) -> str:
     r = (raw or "").upper()
     if "DELIVER" in r or "COMPLETE" in r:
         return "delivered"
+    if "ARRIVED" in r or "STORE" in r:
+        return "arrived"
     if "TRANSIT" in r or "SCHEDULED" in r or "ALLOCATED" in r:
         return "transit"
     if "CANCEL" in r or "FAIL" in r or "ISSUE" in r or "DELAY" in r:
@@ -345,19 +347,45 @@ def get_order_tracking(tracking_id: str,
             if not row:
                 raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND: Order does not exist.")
             else:
-                dest_city = row["destination_city"]
-                hub_addr = row["hub_address"]
+                dest_city = row["destination_city"] or "Regional Hub"
+                hub_addr = row["hub_address"] or f"{dest_city} Goods Shed"
                 norm_status = normalize_status(row["raw_status"])
                 date_str = str(row["order_date"])
                 cargo = row["cargo_name"]
                 weight = f"{int(row['total_weight_num'])} kg"
                 recipient = row["customer_name"]
                 amount = float(row["total_amount"])
-                train_slot = row["allocated_train_slot"]
                 oid = row["order_id"]
 
             code = CITY_TO_CODE.get(dest_city.lower(), "CMB")
             actual_id = f"KP-{oid:05d}-{code}"
+
+            # Query real rail allocation trip details
+            cursor.execute(
+                """
+                SELECT DISTINCT tt.trip_id, tt.departure_datetime, tt.arrival_datetime
+                FROM rail_allocation ra
+                JOIN order_item oi ON ra.order_item_id = oi.order_item_id
+                JOIN train_trip tt ON ra.trip_id = tt.trip_id
+                WHERE oi.order_id = %s
+                ORDER BY tt.departure_datetime ASC
+                """,
+                (oid,)
+            )
+            alloc_trips = cursor.fetchall()
+            if alloc_trips:
+                t = alloc_trips[0]
+                dep_dt = t["departure_datetime"].strftime("%b %d, %I:%M %p") if t.get("departure_datetime") else f"{date_str} 06:10 AM"
+                arr_dt = t["arrival_datetime"].strftime("%b %d, %I:%M %p") if t.get("arrival_datetime") else f"{date_str} 10:45 AM"
+                train_slot = f"Train Trip #{t['trip_id']} (Dep: {dep_dt} → Arr: {arr_dt})"
+            else:
+                dep_dt = f"{date_str} 06:10 AM"
+                arr_dt = f"{date_str} 10:45 AM"
+                train_slot = row["allocated_train_slot"]
+
+            is_scheduled = row["raw_status"] in ("SCHEDULED_FOR_RAIL", "SCHEDULED_MULTI_TRIP")
+            is_arrived = row["raw_status"] in ("ARRIVED_AT_STATION_STORE", "ARRIVED") or norm_status == "arrived"
+            is_delivered = norm_status == "delivered"
 
             # Dynamic milestone generation based on real order state
             milestones = [
@@ -372,34 +400,42 @@ def get_order_tracking(tracking_id: str,
                 MilestoneSchema(
                     title="Rail Carriage Allocated",
                     location="Kandy Central Railway Goods Yard",
-                    time=f"{date_str} 06:10 AM",
-                    description=f"Loaded onto SLR freight wagon. Slot: {train_slot}.",
-                    completed=norm_status in ("transit", "delivered"),
-                    active=False
+                    time=dep_dt,
+                    description=f"Loaded onto SLR freight wagon. {train_slot}." if alloc_trips else f"Carriage slot assigned: {train_slot}.",
+                    completed=is_scheduled or is_arrived or is_delivered or norm_status == "transit",
+                    active=is_scheduled
                 ),
                 MilestoneSchema(
                     title=f"Rail Transit toward {dest_city}",
                     location=f"Mainline Rail Corridor to {dest_city}",
-                    time=f"{date_str} 08:30 AM",
-                    description="Heavy freight transport in progress via Sri Lanka Railways network.",
-                    completed=norm_status in ("transit", "delivered"),
-                    active=norm_status == "transit"
+                    time=dep_dt,
+                    description=f"Heavy freight transit progressing on schedule to {dest_city} Railway Goods Yard.",
+                    completed=is_arrived or is_delivered,
+                    active=(norm_status == "transit" and not is_arrived)
                 ),
                 MilestoneSchema(
                     title=f"Arrival at {dest_city} Regional Hub",
                     location=hub_addr,
-                    time=f"Estimated {date_str} 10:45 AM",
-                    description=f"Carriage decoupling and transfer to {dest_city} last-mile fleet.",
-                    completed=norm_status == "delivered",
-                    active=False
+                    time=arr_dt if not is_arrived else f"Arrived {arr_dt}",
+                    description=(
+                        f"Train arrived at {dest_city} Goods Yard. Consignment inspected & confirmed received by Station Store Manager."
+                        if (is_arrived or is_delivered)
+                        else f"Estimated train arrival: {arr_dt}. Awaiting Store Manager verification and unloading at {dest_city} Hub."
+                    ),
+                    completed=is_arrived or is_delivered,
+                    active=is_arrived
                 ),
                 MilestoneSchema(
                     title="Delivered & Consignment Signed",
-                    location=f"Recipient Hub ({dest_city})",
-                    time=f"Delivered {date_str}",
-                    description=f"Consignment successfully received by {recipient}.",
-                    completed=norm_status == "delivered",
-                    active=norm_status == "delivered"
+                    location=f"Recipient Destination ({dest_city})",
+                    time=f"Delivered {date_str}" if is_delivered else f"Estimated {date_str} Afternoon",
+                    description=(
+                        f"Consignment successfully delivered and signed by {recipient}."
+                        if is_delivered
+                        else f"Queued for last-mile delivery dispatch to {recipient}."
+                    ),
+                    completed=is_delivered,
+                    active=is_delivered or row["raw_status"] in ("OUT_FOR_DELIVERY", "IN_TRANSIT_LAST_MILE")
                 )
             ]
 
@@ -411,7 +447,7 @@ def get_order_tracking(tracking_id: str,
                 cargo=cargo,
                 weight=weight,
                 date=date_str,
-                status=norm_status,
+                status="delivered" if is_delivered else ("arrived" if is_arrived else norm_status),
                 trainSlot=train_slot,
                 recipient=recipient,
                 amount=amount,

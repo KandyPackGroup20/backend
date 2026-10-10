@@ -53,6 +53,7 @@ class StaffCreateRequest(BaseModel):
     role: Literal["SUPERADMIN", "LOGISTICS_MGR", "DISPATCHER", "STORE_MGR", "WAREHOUSE_STAFF", "DRIVER", "ASSISTANT"] # 'LOGISTICS_MGR', 'DISPATCHER', 'STORE_MGR', 'WAREHOUSE_STAFF', 'DRIVER', 'ASSISTANT', 'SUPERADMIN'
     password: str = Field(min_length=6)
     license_number: Optional[str] = Field(default=None, max_length=100)
+    station_id: Optional[int] = Field(default=None, gt=0, description='Explicit station assignment for warehouse staff')
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -324,6 +325,13 @@ def create_staff_user(
                     (payload.name, payload.role, payload.email, pw_hash)
                 )
                 user_id = cursor.lastrowid
+                if payload.station_id is not None:
+                    if payload.role != 'WAREHOUSE_STAFF':
+                        raise HTTPException(422, 'station_id is only for warehouse staff; managers use station_store.manager_id.')
+                    cursor.execute('SELECT station_id FROM station_store WHERE station_id=%s AND is_active=1', (payload.station_id,))
+                    if not cursor.fetchone():
+                        raise HTTPException(422, 'Station is missing or inactive.')
+                    cursor.execute('UPDATE user SET station_id=%s WHERE user_id=%s', (payload.station_id,user_id))
                 if payload.role in {"DRIVER", "ASSISTANT"}:
                     cursor.execute("INSERT INTO delivery_staff (user_id, license_number, work_hours) VALUES (%s, %s, 0)", (user_id, payload.license_number))
                 conn.commit()

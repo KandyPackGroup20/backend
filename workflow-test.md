@@ -142,3 +142,36 @@ Earlier development runs exposed fixture errors (staff email domain/reset trigge
 ### Dependencies and remaining verification
 
 Deploy with the matching frontend changes. Existing Next rewrite forwards both new paths; API middleware exclusion leaves authorization to FastAPI. Config/client contracts are tested, but live browser-to-Next-to-backend proxy traffic and interactive UI behavior are not certified: the Browser skill returned no browser and an empty browser list. Manual UI approval should still exercise input changes/selection clearing, failure/retry, and loading-list status refresh on narrow screens. Inventory deduction and delivery completion remain deliberately outside Phase 3. No database repository file was changed. Ready for code review with that explicit UI verification limitation; this is not merge or deployment approval.
+
+## Phase 4 member — Station inventory and warehouse operations (2026-10-10)
+
+Inspected clean `fullworkflow` branches and reused the prior implementation. No applicable AGENTS.md in these repositories; archived instructions do not apply. Existing manual parameterized SQL, FastAPI and MySQL remain. No README, main, commit, push or merge changes.
+
+### Scope, defects and changed files
+
+- `app/api/v1/inventory.py`: enforce current database station assignment on inventory, manifest lists/items, bins, adjustment writes/history and station reports. Managers use existing manager_id; warehouse staff use the new nullable user.station_id. Removed silent station-1 fallback. Added `/inventory/stations` for actual authorized choices. Warehouse staff can inspect/receive their assigned station's shipments and read its summary. Existing privileged access remains. Manifest list filters actual Kandy-to-destination trips and adds cargo_units.
+- Same file: validate positive IDs, integer adjustment quantities and nonblank bounded reasons; DAMAGED/LOST/EXPIRED must deduct. Existing free-text recount corrections remain supported. Lock inventory for adjustment, retain trigger-driven updates, and support optional Idempotency-Key with conflict detection. Underflow rolls back the adjustment row. Response quantity is read before commit under the same lock. Bin no-op/retry now succeeds while nonexistent inventory/cross-station bins are rejected.
+- Same file: preserve existing receipt procedure argument order and transaction ownership. End authorization read transaction before calling it; set Colombo session timezone. Explicit receipt guards return actionable conflict codes. Already-received remains the existing 409 response without duplicate stock. Passwordless legacy session endpoint remains disabled.
+- `app/api/v1/auth.py`: minimal integration only—optional station_id during SuperAdmin warehouse-staff provisioning; verify role and active station, store assignment atomically. No authentication/role/reset redesign.
+- `tests/test_phase4_inventory.py`: disposable MySQL/FastAPI verification plus inherited lifecycle regressions.
+- `workflow-test.md`: this member's evidence.
+
+### Reconciliation and dependencies
+
+Retained `/api/v1/inventory/...`, singular baseline tables and the four-argument receipt procedure instead of duplicating prompt aliases. The plan explicitly requires station-level staff scoping; no warehouse assignment existed. With no clarification reply, selected explicit nullable warehouse assignment rather than broad all-station permissions. Unassigned staff fail closed; managers retain manager_id scoping. `reason` stays VARCHAR for existing corrections/history rather than a destructive ENUM conversion. Station inventory remains product-level; cargo quantities are units, not invented physical package records.
+
+Apply sibling `database/16_phase4_station_workflow.sql` before deploying the backend. It adds user.station_id and stock_adjustment.request_key and updates receipt. Do not rerun destructive initialization on an existing DB. New warehouse staff use the existing provisioning API/UI selector; explicitly assign legacy staff using approved user/station IDs. Matching frontend uses backend station choices and stable request keys. External callers should supply Idempotency-Key for adjustment retries; keyless historical callers remain supported and each submission represents a distinct adjustment.
+
+### Tests and results
+
+`.venv/Scripts/python.exe -m unittest discover -s tests -p test_phase4_inventory.py -v`: **43/43 passed** in the full run (9 Phase 4 + 34 earlier-phase regressions), 69.267 seconds. Real MySQL/FastAPI, generated disposable schema only; startup migrations and existing databases are untouched. Generated schema was cleaned up. After final null-status guard refinement, the affected `-k receipt` subset was rerun; completion recorded below.
+
+Verified own-station access and cross-station denials for both target roles; unassigned denial; real warehouse provisioning; empty/future/wrong-destination receipt rejection; duplicate/concurrent receipt exactly once; injected order-history failure rolls back stock/manifest/order; closed-order rejection; sequential and concurrent damage handling, duplicate key replay/conflict, underflow rollback; integer/reason validation; bin retry and foreign-bin denial. Scoped report totals after damage match stock and loss value. Inherited tests verify spillover receipt completes only after all legs, and receipt → whole-order roster attachment → explicit delivery start remains working without dispatch stock deduction. No failed roster audit behavior changed.
+
+Frontend: 56 existing regressions plus 2 warehouse render checks passed; TypeScript passed. Scoped lint has zero errors and three existing warehouse warnings (unused import and two navigation recommendations). Migration consistency and diff checks passed. One migration-check command was mistakenly invoked with Node and failed before execution; rerun with Python passed. Earlier 40/42-test runs also passed; full result above includes later receipt/report assertions.
+
+### Remaining issues / readiness
+
+Ready for code review, not deployment approval. Migration and explicit legacy warehouse assignments remain deployment prerequisites. Browser runtime returned an empty list; interactive intake/damage dialog, switching stations, retry behavior and responsive UI/live Next proxy checks are not claimed. Delivery completion and stock deduction at dispatch remain outside this change. Existing bin/search/report UI was reused; no new package-level tracking.
+
+Phase 4 completion: final `-k receipt` subset **4/4 passed** in 9.531 seconds after the null-status refinement (spillover, concurrent/rollback, cancelled/null rejection, roster handoff). Test schema cleaned up. This reruns four of the 43 passing integration tests above. Frontend total is 58 passing tests; final branch and diff checks passed across all three repositories.

@@ -79,6 +79,7 @@ class CreateOrderRequest(BaseModel):
     booking_date: Optional[str] = None
     slot: Optional[str] = "06:30 AM Express Rail 101"
     items: Optional[List[OrderCartItem]] = None
+    delivery_route_id: Optional[int] = None
 
 class MilestoneSchema(BaseModel):
     title: str
@@ -384,6 +385,50 @@ def get_order_tracking(tracking_id: str,
             )
 
 
+@router.get("/routes")
+def get_available_routes(hub: Optional[str] = None):
+    """Return available delivery routes, optionally filtered by destination hub or city."""
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            city_filter = None
+            if hub:
+                hub_key = hub.strip().upper()
+                hub_info = HUB_CODE_MAP.get(hub_key)
+                if not hub_info:
+                    for k, v in HUB_CODE_MAP.items():
+                        if v["name"].lower() == hub.lower():
+                            hub_info = v
+                            break
+                if hub_info:
+                    city_filter = hub_info["city"]
+                else:
+                    city_filter = hub
+
+            if city_filter:
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, dr.station_id, dr.max_delivery_time,
+                           ss.city, ss.address AS station_address
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE LOWER(ss.city) = LOWER(%s) AND ss.is_active = 1
+                    ORDER BY dr.route_id
+                """, (city_filter,))
+            else:
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, dr.station_id, dr.max_delivery_time,
+                           ss.city, ss.address AS station_address
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE ss.is_active = 1
+                    ORDER BY ss.city, dr.route_id
+                """)
+            routes = cursor.fetchall()
+            for r in routes:
+                if "max_delivery_time" in r and isinstance(r["max_delivery_time"], datetime.timedelta):
+                    r["max_delivery_time"] = str(r["max_delivery_time"])
+            return routes
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_consignment_order(payload: CreateOrderRequest, request: Request,
                              current_user: dict = Depends(require_roles(["CUSTOMER"]))):
@@ -410,27 +455,99 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            # 1. Fetch or initialize customer record
             cursor.execute("""
-                SELECT c.customer_id, c.customer_name, c.phone, c.address_line,
-                       c.route_id, ss.city AS station_city
-                FROM customer c
-                JOIN delivery_route dr ON dr.route_id=c.route_id
-                JOIN station_store ss ON ss.station_id=dr.station_id
-                WHERE c.user_id=%s AND ss.is_active=1
+                SELECT customer_id, customer_name, phone, address_line, route_id, city
+                FROM customer
+                WHERE user_id=%s
             """, (current_user["user_id"],))
             cust_row = cursor.fetchone()
             if not cust_row:
-                raise HTTPException(status_code=422, detail={"error_code": "CUSTOMER_ROUTE_REQUIRED", "message": "Your customer profile needs a delivery route before checkout."})
-            if cust_row["station_city"].casefold() != hub_info["city"].casefold():
-                raise HTTPException(status_code=422, detail={"error_code": "ORDER_ROUTE_MISMATCH", "message": "Select the hub matching your saved customer route."})
-            customer_id = cust_row["customer_id"]
-            customer_display_name = (payload.recipient_name if payload.recipient_name is not None else cust_row["customer_name"]).strip()
-            customer_phone = (payload.recipient_phone if payload.recipient_phone is not None else cust_row["phone"]).strip()
-            delivery_addr = (payload.delivery_address if payload.delivery_address is not None else cust_row["address_line"]).strip()
+                cursor.execute(
+                    """
+                    INSERT INTO customer (user_id, customer_name, phone, address_line, city)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        current_user["user_id"],
+                        payload.recipient_name or current_user.get("name", "Customer"),
+                        payload.recipient_phone or "0771234567",
+                        payload.delivery_address or "Delivery Address",
+                        hub_info["city"]
+                    )
+                )
+                customer_id = cursor.lastrowid
+                cust_row = {
+                    "customer_id": customer_id,
+                    "customer_name": current_user.get("name", "Customer"),
+                    "phone": payload.recipient_phone,
+                    "address_line": payload.delivery_address,
+                    "route_id": None,
+                    "city": hub_info["city"]
+                }
+            else:
+                customer_id = cust_row["customer_id"]
+
+            # 2. Resolve target delivery route
+            chosen_route = None
+
+            # A: If user explicitly provided a route in the payload
+            if payload.delivery_route_id:
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, ss.city AS station_city
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE dr.route_id = %s AND ss.is_active = 1
+                """, (payload.delivery_route_id,))
+                chosen_route = cursor.fetchone()
+
+            # B: If no route passed or mismatched, find default route for this hub's city
+            if not chosen_route:
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, ss.city AS station_city
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE LOWER(ss.city) = LOWER(%s) AND ss.is_active = 1
+                    ORDER BY dr.route_id ASC
+                    LIMIT 1
+                """, (hub_info["city"],))
+                chosen_route = cursor.fetchone()
+
+            # C: If still not found, check customer's saved profile route
+            if not chosen_route and cust_row.get("route_id"):
+                cursor.execute("""
+                    SELECT dr.route_id, dr.route_name, ss.city AS station_city
+                    FROM delivery_route dr
+                    JOIN station_store ss ON ss.station_id = dr.station_id
+                    WHERE dr.route_id = %s AND ss.is_active = 1
+                """, (cust_row["route_id"],))
+                chosen_route = cursor.fetchone()
+
+            # D: Fallback if destination station has no delivery route yet in DB
+            if not chosen_route:
+                cursor.execute("SELECT station_id FROM station_store WHERE LOWER(city) = LOWER(%s) LIMIT 1", (hub_info["city"],))
+                st = cursor.fetchone()
+                if st:
+                    cursor.execute("INSERT INTO delivery_route (station_id, route_name, max_delivery_time) VALUES (%s, %s, '04:00:00')",
+                                   (st["station_id"], f"{hub_info['city']} Regional Route"))
+                    chosen_route = {"route_id": cursor.lastrowid, "route_name": f"{hub_info['city']} Regional Route", "station_city": hub_info["city"]}
+
+            if not chosen_route:
+                raise HTTPException(status_code=422, detail={"error_code": "CUSTOMER_ROUTE_REQUIRED", "message": "Please select a valid delivery route for checkout."})
+
+            chosen_route_id = chosen_route["route_id"]
+
+            # Keep customer profile synced with the chosen route & destination city
+            cursor.execute("UPDATE customer SET route_id = %s, city = %s WHERE customer_id = %s",
+                           (chosen_route_id, hub_info["city"], customer_id))
+
+            customer_display_name = (payload.recipient_name if payload.recipient_name is not None else cust_row.get("customer_name") or "Recipient").strip()
+            customer_phone = (payload.recipient_phone if payload.recipient_phone is not None else cust_row.get("phone") or "0771234567").strip()
+            delivery_addr = (payload.delivery_address if payload.delivery_address is not None else cust_row.get("address_line") or "Delivery Address").strip()
             if not all((customer_display_name, customer_phone, delivery_addr)):
                 raise HTTPException(status_code=422, detail={"error_code": "ORDER_DESTINATION_REQUIRED", "message": "Provide a recipient name, phone and delivery address."})
 
-            # 2. Dates
+            # 3. Dates
             order_date = datetime.date.today()
             if payload.booking_date:
                 try:
@@ -440,13 +557,13 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
             else:
                 delivery_date = order_date + datetime.timedelta(days=7)
 
-            # 3. Insert customer_order
+            # 4. Insert customer_order
             cursor.execute(
                 """
                 INSERT INTO customer_order (customer_id, order_date, delivery_date, status, delivery_route_id, delivery_address, recipient_name, recipient_phone)
                 VALUES (%s, %s, %s, 'PENDING_RAIL_SCHEDULING', %s, %s, %s, %s)
                 """,
-                (customer_id, order_date, delivery_date, cust_row["route_id"], delivery_addr, customer_display_name, customer_phone)
+                (customer_id, order_date, delivery_date, chosen_route_id, delivery_addr, customer_display_name, customer_phone)
             )
             order_id = cursor.lastrowid
             tracking_code = f"KP-{order_id:05d}-{hub_key}"

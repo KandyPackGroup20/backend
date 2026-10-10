@@ -130,6 +130,24 @@ def run_migrations():
                         pass
                     logger.info("Added audit_log.roster_id.")
 
+                # 5b. Ensure all active stations have delivery routes
+                try:
+                    routes_to_seed = [
+                        (1, 'Colombo Central Commercial Route', '04:30:00'),
+                        (1, 'Greater Colombo Industrial Hub Route', '06:00:00'),
+                        (2, 'Negombo Coastal & Industrial Route', '04:00:00'),
+                        (3, 'Galle Coastal Route', '05:00:00'),
+                        (4, 'Matara Southern Express Route', '04:30:00'),
+                        (5, 'Jaffna Northern Peninsula Route', '05:00:00'),
+                        (6, 'Trincomalee Eastern Port Route', '04:30:00'),
+                    ]
+                    for st_id, r_name, max_t in routes_to_seed:
+                        cur.execute("SELECT route_id FROM delivery_route WHERE station_id = %s AND route_name = %s", (st_id, r_name))
+                        if not cur.fetchone():
+                            cur.execute("INSERT INTO delivery_route (station_id, route_name, max_delivery_time) VALUES (%s, %s, %s)", (st_id, r_name, max_t))
+                except Exception as e:
+                    logger.warning(f"Could not seed delivery routes: {e}")
+
                 # 6. Ensure Core Database Views
                 # View 1: v_trip_capacity_usage (Feature 4.2 / Rail schedules & analytics)
                 try:

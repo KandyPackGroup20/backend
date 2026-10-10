@@ -42,6 +42,17 @@ class FakeReportingRepository:
 
 class HoursApiTests(unittest.TestCase):
     def setUp(self):
+        # Phase 1 authenticates current account state, rather than trusting JWT roles.
+        # Keep this unit suite isolated from the configured application database.
+        auth_db = patch('app.core.security.get_db')
+        connection = auth_db.start().return_value.__enter__.return_value
+        self.addCleanup(auth_db.stop)
+        cursor = connection.cursor.return_value.__enter__.return_value
+        users = {777+i: {'user_id': 777+i, 'role': role, 'force_password_reset': reset,
+                        'email': 'unit@kandypack.lk', 'name': 'Unit account'}
+                 for i, (role, reset) in enumerate((('DISPATCHER', False), ('SUPERADMIN', False),
+                     ('LOGISTICS_MGR', False), ('CUSTOMER', False), ('DRIVER', False), ('DISPATCHER', True)))}
+        cursor.fetchone.side_effect = lambda: users.get(cursor.execute.call_args.args[1][0])
         self.repository = FakeReportingRepository()
         self.app = FastAPI()
         self.app.include_router(router, prefix="/api/v1")
@@ -51,8 +62,9 @@ class HoursApiTests(unittest.TestCase):
 
     @staticmethod
     def auth(role="DISPATCHER", *, force_reset=False):
+        user_id = 782 if force_reset else 777 + ['DISPATCHER', 'SUPERADMIN', 'LOGISTICS_MGR', 'CUSTOMER', 'DRIVER'].index(role)
         token = create_access_token({
-            "sub": "777", "role": role, "force_password_reset": force_reset,
+            "sub": str(user_id), "role": role, "force_password_reset": force_reset,
         }, expires_delta=timedelta(minutes=10))
         return {"Authorization": f"Bearer {token}"}
 

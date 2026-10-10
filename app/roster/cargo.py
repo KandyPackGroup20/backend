@@ -132,6 +132,69 @@ def reading():
 
 
 class CargoRepository:
+    def start(self, roster_id, actor_id):
+        """Start only already attached, fully received whole orders, atomically."""
+        with get_db() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    conn.begin()
+                    cursor.execute("SELECT route_id,truck_id FROM roster_assignment WHERE roster_id=%s", (roster_id,))
+                    identity = cursor.fetchone()
+                    if not identity:
+                        raise CargoError("ROSTER_NOT_FOUND", "Truck schedule not found.", 404)
+                    # Same resource order as whole-order attachment and roster creation.
+                    cursor.execute("SELECT station_id FROM delivery_route WHERE route_id=%s FOR UPDATE", (identity['route_id'],))
+                    station = cursor.fetchone()['station_id']
+                    cursor.execute("SELECT is_active FROM truck WHERE truck_id=%s FOR UPDATE", (identity['truck_id'],))
+                    truck = cursor.fetchone()
+                    cursor.execute("SELECT * FROM roster_assignment WHERE roster_id=%s FOR UPDATE", (roster_id,))
+                    run = cursor.fetchone()
+                    if not run or run['route_id'] != identity['route_id'] or run['truck_id'] != identity['truck_id']:
+                        raise CargoError("RUN_CHANGED", "The schedule changed. Refresh the loading list and retry.")
+                    cursor.execute("SELECT order_id FROM delivery WHERE roster_id=%s AND delivery_status<>'CANCELLED' ORDER BY order_id", (roster_id,))
+                    ids = [row['order_id'] for row in cursor.fetchall()]
+                    if not ids:
+                        raise CargoError("RUN_EMPTY", "Attach whole orders before starting delivery.")
+                    for order_id in ids:
+                        cursor.execute("SELECT order_id FROM customer_order WHERE order_id=%s FOR UPDATE", (order_id,))
+                        cursor.fetchone()
+                    cursor.execute(f"SELECT oi.order_item_id FROM order_item oi JOIN product p ON p.product_id=oi.product_id WHERE oi.order_id IN ({placeholders(ids)}) ORDER BY oi.order_item_id FOR UPDATE", tuple(ids))
+                    cursor.fetchall()
+                    cursor.execute(f"SELECT ra.allocation_id FROM rail_allocation ra JOIN order_item oi ON oi.order_item_id=ra.order_item_id JOIN train_trip tt ON tt.trip_id=ra.trip_id LEFT JOIN manifest m ON m.trip_id=tt.trip_id AND m.station_id=tt.destination_station_id WHERE oi.order_id IN ({placeholders(ids)}) ORDER BY ra.allocation_id FOR SHARE", tuple(ids))
+                    cursor.fetchall()
+                    cursor.execute("SELECT delivery_id,order_id,delivery_status FROM delivery WHERE roster_id=%s AND delivery_status<>'CANCELLED' ORDER BY delivery_id FOR UPDATE", (roster_id,))
+                    deliveries = cursor.fetchall()
+                    orders = self._orders(cursor, f"co.order_id IN ({placeholders(ids)})", tuple(ids))
+                    if sorted(d['order_id'] for d in deliveries) != ids or len(orders) != len(ids) or any(o['assigned_roster_id'] != roster_id for o in orders):
+                        raise CargoError("RUN_CHANGED", "Attached orders changed. Refresh the loading list and retry.")
+                    if run['status'] == 'IN_TRANSIT' and all(d['delivery_status'] == 'IN_TRANSIT' for d in deliveries) and all(o['order_status'] == 'OUT_FOR_DELIVERY' for o in orders):
+                        conn.rollback()
+                        return dict(status='SUCCESS', result_code='DELIVERY_ALREADY_STARTED', roster_id=roster_id)
+                    if run['status'] != 'SCHEDULED' or any(d['delivery_status'] != 'ASSIGNED' for d in deliveries):
+                        raise CargoError("INVALID_START_TRANSITION", "Only scheduled runs with assigned deliveries can start.")
+                    if not truck['is_active']:
+                        raise CargoError("TRUCK_INACTIVE", "The scheduled truck is inactive.")
+                    for order in orders:
+                        if order['order_status'] != 'ARRIVED_AT_STATION_STORE':
+                            raise CargoError("INVALID_ORDER_TRANSITION", "Every attached order must be received at the station before departure.")
+                        if order['route_id'] != run['route_id'] or order['station_id'] != station:
+                            raise CargoError("ORDER_ROUTE_MISMATCH", "An attached order does not match the scheduled route.")
+                        reasons = [r for r in order['blocked_reasons'] if r != 'ORDER_ALREADY_ASSIGNED']
+                        if reasons:
+                            raise CargoError(reasons[0], "An attached order no longer satisfies station receipt and cargo checks.")
+                    cursor.execute("UPDATE roster_assignment SET status='IN_TRANSIT' WHERE roster_id=%s", (roster_id,))
+                    cursor.execute("UPDATE delivery SET delivery_status='IN_TRANSIT' WHERE roster_id=%s AND delivery_status='ASSIGNED'", (roster_id,))
+                    for order_id in ids:
+                        cursor.execute("UPDATE customer_order SET status='OUT_FOR_DELIVERY' WHERE order_id=%s", (order_id,))
+                        cursor.execute("INSERT INTO order_status_history (order_id,status,changed_by) VALUES (%s,'OUT_FOR_DELIVERY',%s)", (order_id, actor_id))
+                    cursor.execute("INSERT INTO audit_log (user_id,action,entity_id,outcome,entity_name,roster_id) VALUES (%s,'START_DELIVERY',%s,'ACCEPTED','roster_assignment',NULL)", (actor_id, roster_id))
+                conn.commit()
+                return dict(status='SUCCESS', result_code='DELIVERY_STARTED', roster_id=roster_id)
+            except Exception:
+                conn.rollback()
+                raise
+
     def stores(self):
         with reading() as cursor:
             cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 ORDER BY city, station_id")

@@ -132,6 +132,19 @@ def get_roster_candidates(
         ) from exc
 
 
+@router.get("/availability")
+def crew_availability(route_id: Annotated[int, Query(gt=0)], truck_id: Annotated[int, Query(gt=0)],
+                      window: tuple[datetime, datetime] = Depends(assignment_window),
+                      driver_id: Annotated[int | None, Query(gt=0)] = None,
+                      assistant_id: Annotated[int | None, Query(gt=0)] = None,
+                      user: dict = Depends(require_roster_reader),
+                      repository=Depends(get_roster_assignment_repository)):
+    from app.roster.availability import availability
+    if window[0].year < 1000 or (window[1] - window[0]).days > 366:
+        raise HTTPException(status_code=422, detail={"error_code": "INVALID_ROSTER_WINDOW", "message": "Choose a supported scheduling interval of at most 366 days."})
+    return cargo_operation(lambda: availability(route_id, truck_id, *window, driver_id, assistant_id))
+
+
 @router.get("/assignments", response_model=AssignmentsResponse)
 def get_roster_assignments(
     current_user: dict = Depends(require_roster_reader),
@@ -286,3 +299,8 @@ def cargo_loading_list(roster_id: int, user: dict = Depends(require_roster_reade
 def assign_whole_orders(roster_id: int, request: CargoSelection,
                         user: dict = Depends(require_roster_writer), repository=Depends(get_cargo_repository)):
     return cargo_operation(lambda: repository.assign(roster_id, request.order_ids, user["user_id"]))
+
+
+@router.post("/schedules/{roster_id}/start")
+def start_delivery(roster_id: int, user: dict = Depends(require_roster_writer), repository=Depends(get_cargo_repository)):
+    return cargo_operation(lambda: repository.start(roster_id, user['user_id']))

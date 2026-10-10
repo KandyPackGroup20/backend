@@ -101,3 +101,44 @@ Browser interaction remains blocked (no connected browser). Production-domain/co
 Ready for Phase 2 code review after the final passing suite, with the SQL/backend/frontend changes reviewed together. This is not full-lifecycle or deployment approval.
 
 Phase 2 completion result: **28/28 passed** in the final complete run (15 rail tests + 13 identity regressions), including migration repeatability/backfill and allocation-to-inventory receipt. The generated disposable schema was cleaned up. Migration consistency and all repository diff checks passed. No existing database, main branch, push or merge was changed.
+
+## Phase 3 member — start delivery, fatigue information, eligible crew (2026-10-10)
+
+Resumed the interrupted work without resetting it. All three repositories were on `fullworkflow`; backend and frontend contained the preserved 14-file change set, and database was clean. No applicable AGENTS.md exists in these repositories or their parent paths; the instructions in the archived option3 checkout do not apply. No README, commit, push, merge, or main change was made.
+
+### Scope, defects, and files
+
+- `app/api/v1/roster.py`: adds authenticated GET `/api/v1/roster/availability` (route_id, truck_id, from/to with explicit offsets, optional selected driver_id/assistant_id) and POST `/api/v1/roster/schedules/{roster_id}/start`. Reuses existing roster read/write guards and no-store/error handling. Existing writers include DISPATCHER, SUPERADMIN and LOGISTICS_MGR; their permissions were preserved.
+- `app/roster/cargo.py`: missing explicit departure transition implemented in one transaction. Locks route/truck/roster, attached orders/items/products, rail receipt evidence and deliveries; validates membership, scheduled/assigned state, route, full receipt, and station order status. Roster and deliveries become IN_TRANSIT; orders become OUT_FOR_DELIVERY, with status history and one ACCEPTED START_DELIVERY audit. Concurrent/repeated starts have no duplicate effect. Failures roll back all writes. The extra membership recheck rejects a loading list changed while locks were acquired.
+- `app/roster/availability.py`: previously the catalog was unfiltered. The read-only snapshot now calls the existing assignment policy for candidate pairs, using selected counterpart, route and truck. Excludes inactive/wrong-type staff, overlaps, existing consecutive-duty/rest violations and weekly overages. Computes existing/proposed/projected seconds and remaining seconds for every affected Colombo week using existing splitting and limit constants.
+- `tests/test_phase3_roster.py`: disposable real-MySQL/FastAPI verification, extending the existing identity/rail harness.
+- `tests/test_roster_availability.py`: candidate filtering, exact cap, cancellation, pair, route, rest and cross-week regressions.
+- `tests/test_roster_hours.py`: repaired legacy unit fixtures after Phase 1 added current-account database authentication. Only the account lookup is mocked; signed JWT decoding, actual authentication dependency, role checks and reset checks still execute. Production authentication was not changed or bypassed.
+- `workflow-test.md`: this appended member record.
+
+### Preserved behavior and schema decisions
+
+Create roster → attach whole orders → start delivery remains three separate requests. Neither creation nor attachment marks orders OUT_FOR_DELIVERY. Existing assignment locking and DemoV1RosterPolicy validation still run at submission, independently of advisory availability reads; rejection handling and accepted-only roster audit remain unchanged. Rest rules mean the existing touching-duty chain rules, not a newly invented minimum-rest interval. Equality with the 40-hour driver / 60-hour assistant limit remains valid.
+
+Uses existing singular tables and supported IN_TRANSIT status, not new tables or aliases. The unique audit_log.roster_id link is reserved by the schema for ASSIGN_ROSTER: START_DELIVERY uses entity_name/entity_id with a NULL roster_id, matching the existing unrelated-action convention. No rejected audit is written. Rail audit outcomes are a separate earlier feature and were not changed.
+
+No schema migration is needed. Existing roster SQL (`09_roster_assignment.sql`, `10_roster_reporting.sql`) and Phase 1/2 schema/triggers are prerequisites. Do not rerun destructive initialization on an existing database. The test harness creates a generated `kandypack_phase1_test_<uuid>` database, loads the actual schema/rail/receipt/roster SQL after stripping original database selection/reset statements, and removes only that generated schema. Application startup migration/seed hooks are not run. `ROSTER_DATA_MODE=mysql` is required for these features.
+
+### Actual verification after resume
+
+From backend, `.venv/Scripts/python.exe -m unittest discover -s tests -p <filename> -v`:
+
+| Filename | Result |
+| --- | --- |
+| test_phase3_roster.py | 34/34 passed in 50.884 seconds: 6 Phase 3 + 28 inherited identity/rail tests |
+| test_roster_hours.py | 11/11 passed |
+| test_roster_availability.py | 5/5 passed |
+| test_roster_policy.py | 17/17 passed |
+
+Integration evidence includes actual rail allocation and station receipt, unchanged order state after schedule creation/attachment, successful dispatcher start, repeated and concurrent starts, cancelled/completed/empty rejection, station-status recheck, customer/anonymous denial, and unchanged inventory. A deliberately failing MySQL audit trigger proved rollback of roster, delivery, order and status history; its expected logged exception is part of the passing test. Availability is refreshed for overlap/touching/later intervals; inactive crew are removed and final submission rejects them. All roster audit outcomes remain ACCEPTED. Last disposable schema: `kandypack_phase1_test_b634a0ceb62041709eb5791dc16d85a2`, cleaned up by the harness.
+
+Earlier development runs exposed fixture errors (staff email domain/reset trigger expectations, an overly broad audit assertion, and legacy hours authentication setup); these were corrected, not hidden. Above counts are the fresh resumed passing runs. Sibling frontend: 47/47 tests, TypeScript, and changed-source lint passed. `git diff --check` passed in all three repositories.
+
+### Dependencies and remaining verification
+
+Deploy with the matching frontend changes. Existing Next rewrite forwards both new paths; API middleware exclusion leaves authorization to FastAPI. Config/client contracts are tested, but live browser-to-Next-to-backend proxy traffic and interactive UI behavior are not certified: the Browser skill returned no browser and an empty browser list. Manual UI approval should still exercise input changes/selection clearing, failure/retry, and loading-list status refresh on narrow screens. Inventory deduction and delivery completion remain deliberately outside Phase 3. No database repository file was changed. Ready for code review with that explicit UI verification limitation; this is not merge or deployment approval.

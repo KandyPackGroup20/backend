@@ -403,114 +403,107 @@ def get_rail_capacity_utilisation():
 
 @router.get("/workforce-hours")
 def get_workforce_hours():
+    query = """
+        WITH weekly_hours AS (
+            SELECT
+                ds.delivery_staff_id,
+                u.name AS staff_name,
+                u.role AS staff_role,
+                YEARWEEK(ra.start_time, 1) AS work_week,
+                SUM(
+                    TIMESTAMPDIFF(
+                        MINUTE,
+                        ra.start_time,
+                        ra.end_time
+                    )
+                ) / 60.0 AS accumulated_hours,
+                CASE
+                    WHEN u.role = 'DRIVER' THEN 40.00
+                    WHEN u.role = 'ASSISTANT' THEN 60.00
+                END AS weekly_cap
+            FROM roster_assignment ra
+            JOIN delivery_staff ds
+                ON (
+                    ra.driver_id = ds.delivery_staff_id
+                    OR ra.assistant_id = ds.delivery_staff_id
+                )
+            JOIN user u
+                ON ds.user_id = u.user_id
+            WHERE
+                u.role IN ('DRIVER', 'ASSISTANT')
+                AND ra.status <> 'CANCELLED'
+            GROUP BY
+                ds.delivery_staff_id,
+                u.name,
+                u.role,
+                YEARWEEK(ra.start_time, 1)
+        )
+        SELECT
+            delivery_staff_id,
+            staff_name,
+            staff_role,
+            work_week,
+            ROUND(accumulated_hours, 2) AS accumulated_hours,
+            weekly_cap,
+            ROUND(
+                accumulated_hours / NULLIF(weekly_cap, 0) * 100,
+                1
+            ) AS utilization_pct,
+            CASE
+                WHEN accumulated_hours >= weekly_cap
+                    THEN 'CAP_REACHED'
+                WHEN accumulated_hours >= weekly_cap * 0.9
+                    THEN 'NEAR_CAP_WARNING'
+                ELSE 'SAFE'
+            END AS status_flag
+        FROM weekly_hours
+        ORDER BY work_week, staff_name
+    """
+
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT
-                    ds.delivery_staff_id,
-                    u.name AS staff_name,
-                    u.role AS staff_role,
-                    ds.work_hours AS accumulated_hours,
-
-                    CASE
-                        WHEN u.role = 'DRIVER' THEN 40.00
-                        WHEN u.role = 'ASSISTANT' THEN 60.00
-                        ELSE NULL
-                    END AS weekly_cap,
-
-                    ROUND(
-                        (
-                            ds.work_hours /
-                            NULLIF(
-                                CASE
-                                    WHEN u.role = 'DRIVER' THEN 40.00
-                                    WHEN u.role = 'ASSISTANT' THEN 60.00
-                                    ELSE NULL
-                                END,
-                                0
-                            )
-                        ) * 100,
-                        1
-                    ) AS utilization_pct,
-
-                    CASE
-                        WHEN u.role = 'DRIVER'
-                             AND ds.work_hours >= 40
-                            THEN 'CAP_REACHED'
-
-                        WHEN u.role = 'ASSISTANT'
-                             AND ds.work_hours >= 60
-                            THEN 'CAP_REACHED'
-
-                        WHEN u.role = 'DRIVER'
-                             AND ds.work_hours >= 36
-                            THEN 'NEAR_CAP_WARNING'
-
-                        WHEN u.role = 'ASSISTANT'
-                             AND ds.work_hours >= 54
-                            THEN 'NEAR_CAP_WARNING'
-
-                        ELSE 'SAFE'
-                    END AS status_flag
-
-                FROM delivery_staff ds
-
-                JOIN user u
-                    ON ds.user_id = u.user_id
-
-                WHERE u.role IN ('DRIVER', 'ASSISTANT')
-
-                ORDER BY utilization_pct DESC
-            """)
-
-            data = cursor.fetchall()
-            return {"workforce_hours": data}
+            cursor.execute(query)
+            return {"workforce_hours": cursor.fetchall()}
 
 @router.get("/truck-utilisation")
 def get_truck_utilisation():
+    query = """
+        SELECT
+            t.truck_id,
+            t.plate_number,
+            YEAR(ra.start_time) AS usage_year,
+            MONTH(ra.start_time) AS usage_month,
+            COUNT(ra.roster_id) AS total_delivery_runs,
+            COUNT(DISTINCT ra.route_id) AS total_routes,
+            ROUND(
+                SUM(
+                    TIMESTAMPDIFF(
+                        MINUTE,
+                        ra.start_time,
+                        ra.end_time
+                    )
+                ) / 60.0,
+                2
+            ) AS total_operating_hours
+        FROM truck t
+        JOIN roster_assignment ra
+            ON t.truck_id = ra.truck_id
+        WHERE ra.status <> 'CANCELLED'
+        GROUP BY
+            t.truck_id,
+            t.plate_number,
+            YEAR(ra.start_time),
+            MONTH(ra.start_time)
+        ORDER BY
+            usage_year,
+            usage_month,
+            t.truck_id
+    """
+
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT
-                    t.truck_id,
-                    t.plate_number,
-
-                    COUNT(ra.roster_id) AS total_delivery_runs,
-
-                    COUNT(DISTINCT ra.route_id) AS total_routes,
-
-                    ROUND(
-                        COALESCE(
-                            SUM(
-                                TIMESTAMPDIFF(
-                                    MINUTE,
-                                    ra.start_time,
-                                    ra.end_time
-                                )
-                            ) / 60.0,
-                            0
-                        ),
-                        2
-                    ) AS total_operating_hours
-
-                FROM truck t
-
-                LEFT JOIN roster_assignment ra
-                    ON t.truck_id = ra.truck_id
-
-                GROUP BY
-                    t.truck_id,
-                    t.plate_number
-
-                ORDER BY
-                    total_delivery_runs DESC,
-                    t.truck_id
-            """)
-
-            data = cursor.fetchall()
-
-            return {"truck_utilisation": data}
-
+            cursor.execute(query)
+            return {"truck_utilisation": cursor.fetchall()}
 
 @router.get("/station-inventory")
 def get_station_inventory_report():

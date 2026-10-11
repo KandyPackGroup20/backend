@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,7 +14,10 @@ from app.core.migrations import run_migrations
 async def lifespan(app: FastAPI):
     # Ensure all tables and columns exist upon startup (Render cloud DB / local)
     try:
-        run_migrations()
+        if os.getenv("RUN_STARTUP_MIGRATIONS", "true").lower() == "true":
+            run_migrations()
+        else:
+           print("[STARTUP] Automatic migrations disabled.")
     except Exception as e:
         print(f"[STARTUP DB MIGRATION WARNING] Failed to run migrations on startup: {e}")
     try:
@@ -102,6 +106,11 @@ def health_check():
 
 @app.get("/migrate")
 def trigger_migrate():
+    if os.getenv("RUN_STARTUP_MIGRATIONS", "true").lower() != "true":
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Not Found"},
+        )
     from app.core.migrations import run_migrations
     from app.core.cache import reset_login_failures
     success = run_migrations()

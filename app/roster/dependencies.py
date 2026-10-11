@@ -37,14 +37,14 @@ def require_roster_reader(
 
 
 def require_roster_writer(
-    user: dict = Depends(require_roles(["DISPATCHER", "SUPERADMIN", "LOGISTICS_MGR"])),
+    user: dict = Depends(require_roles(["DISPATCHER", "SUPERADMIN"])),
 ) -> dict:
     return _require_reset_complete(user)
 
 
 def get_roster_repository() -> RosterRepository:
     global _adapter, _initialization_failed
-    if os.environ.get("ROSTER_DATA_MODE") == "mysql":
+    if os.environ.get("ROSTER_DATA_MODE", "mysql") == "mysql":
         # Stateless: each operation opens its own connection, including across workers.
         return MySQLRosterAdapter()
     if os.environ.get("APP_ENV") != "development" or os.environ.get("ROSTER_DATA_MODE") != "dev-memory":
@@ -83,7 +83,7 @@ def get_roster_repository() -> RosterRepository:
 
 
 def get_roster_assignment_repository() -> MySQLRosterAdapter:
-    if os.environ.get("ROSTER_DATA_MODE") == "mysql":
+    if os.environ.get("ROSTER_DATA_MODE", "mysql") == "mysql":
         return MySQLRosterAdapter()
     raise HTTPException(
         status_code=503,
@@ -96,7 +96,7 @@ def get_roster_assignment_repository() -> MySQLRosterAdapter:
 
 def get_roster_reporting_repository() -> RosterReportingRepository:
     """Return the database-backed repository for roster reports."""
-    if os.environ.get("ROSTER_DATA_MODE") == "mysql":
+    if os.environ.get("ROSTER_DATA_MODE", "mysql") == "mysql":
         return MySQLRosterAdapter()
     if (os.environ.get("APP_ENV") == "development"
             and os.environ.get("ROSTER_DATA_MODE") == "dev-memory"):

@@ -63,7 +63,7 @@ router = APIRouter(
 
 
 def get_cargo_repository() -> CargoRepository:
-    if os.environ.get("ROSTER_DATA_MODE") != "mysql":
+    if os.environ.get("ROSTER_DATA_MODE", "mysql") != "mysql":
         raise HTTPException(status_code=503, detail={"error_code": "TRUCK_SCHEDULING_UNAVAILABLE",
                             "message": "Planned cargo requires the roster MySQL database."})
     return CargoRepository()
@@ -405,3 +405,56 @@ def complete_driver_delivery(
 
             conn.commit()
             return {"status": "SUCCESS", "message": f"Delivery #{delivery_id} marked as DELIVERED.", "order_id": deliv["order_id"]}
+
+
+@router.get("/train-trips")
+def get_roster_incoming_train_trips(
+    station_id: int = Query(..., description="Target destination station ID"),
+    current_user: dict = Depends(require_roles(["DISPATCHER", "SUPERADMIN", "LOGISTICS_MGR", "STORE_MGR", "WAREHOUSE_STAFF"]))
+):
+    """List arriving freight train trips, manifests, and cargo count for the selected regional station store."""
+    from app.core.database import get_db
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 
+                    tt.trip_id,
+                    tt.origin_station_id,
+                    ss_orig.city AS origin_city,
+                    tt.destination_station_id,
+                    ss_dest.city AS destination_city,
+                    tt.departure_datetime,
+                    tt.arrival_datetime,
+                    tt.total_capacity,
+                    tt.status AS trip_status,
+                    COALESCE(m.manifest_id, 0) AS manifest_id,
+                    COALESCE(m.status, 'SCHEDULED') AS manifest_status,
+                    m.received_at,
+                    COUNT(DISTINCT ra.order_item_id) AS allocated_items_count,
+                    COUNT(DISTINCT oi.order_id) AS allocated_orders_count,
+                    COALESCE(SUM(ra.allocated_quantity * p.unit_weight_kg), 0) AS total_cargo_weight_kg
+                FROM train_trip tt
+                JOIN station_store ss_orig ON ss_orig.station_id = tt.origin_station_id
+                JOIN station_store ss_dest ON ss_dest.station_id = tt.destination_station_id
+                LEFT JOIN manifest m ON m.trip_id = tt.trip_id AND m.station_id = tt.destination_station_id
+                LEFT JOIN rail_allocation ra ON ra.trip_id = tt.trip_id
+                LEFT JOIN order_item oi ON oi.order_item_id = ra.order_item_id
+                LEFT JOIN product p ON p.product_id = oi.product_id
+                WHERE tt.destination_station_id = %s
+                GROUP BY tt.trip_id, tt.origin_station_id, ss_orig.city, tt.destination_station_id, ss_dest.city,
+                         tt.departure_datetime, tt.arrival_datetime, tt.total_capacity, tt.status,
+                         m.manifest_id, m.status, m.received_at
+                ORDER BY tt.departure_datetime DESC, tt.trip_id DESC
+                LIMIT 20
+            """, (station_id,))
+            rows = cursor.fetchall()
+            for r in rows:
+                if r.get("departure_datetime"):
+                    r["departure_datetime"] = str(r["departure_datetime"])
+                if r.get("arrival_datetime"):
+                    r["arrival_datetime"] = str(r["arrival_datetime"])
+                if r.get("received_at"):
+                    r["received_at"] = str(r["received_at"])
+                r["total_cargo_weight_kg"] = float(r["total_cargo_weight_kg"])
+                r["total_capacity"] = float(r["total_capacity"])
+            return {"trips": rows, "station_id": station_id}

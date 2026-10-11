@@ -51,13 +51,18 @@ ITEM_SQL = """
            oi.quantity AS ordered_quantity, p.unit_weight_kg,
            COALESCE(a.allocated_quantity,0) AS allocated_quantity,
            COALESCE(a.received_quantity,0) AS received_quantity,
-           COALESCE(a.wrong_destination,0) AS wrong_destination
+           COALESCE(a.wrong_destination,0) AS wrong_destination,
+           a.trip_id, a.trip_status, a.manifest_status
     FROM order_item oi
     JOIN product p ON p.product_id=oi.product_id
     JOIN customer_order co ON co.order_id=oi.order_id
     JOIN delivery_route dr ON dr.route_id=co.delivery_route_id
     LEFT JOIN (
-        SELECT ra.order_item_id, SUM(ra.allocated_quantity) AS allocated_quantity,
+        SELECT ra.order_item_id,
+               MAX(tt.trip_id) AS trip_id,
+               MAX(tt.status) AS trip_status,
+               MAX(m.status) AS manifest_status,
+               SUM(ra.allocated_quantity) AS allocated_quantity,
                SUM(CASE WHEN tt.destination_station_id=dest.station_id
                         AND m.station_id=dest.station_id AND m.status='RECEIVED'
                         AND m.received_at IS NOT NULL THEN ra.allocated_quantity ELSE 0 END) AS received_quantity,
@@ -159,9 +164,15 @@ class CargoRepository:
             weight, reasons = assess_order(order, items)
             if order["assigned_roster_id"] is not None:
                 reasons.append("ORDER_ALREADY_ASSIGNED")
+            trip_id = next((i["trip_id"] for i in items if i.get("trip_id")), None)
+            manifest_status = next((i["manifest_status"] for i in items if i.get("manifest_status")), None)
+            trip_status = next((i["trip_status"] for i in items if i.get("trip_status")), None)
             result.append(serialized(order) | {
                 "items": [serialized(i) for i in items], "weight_kg": money(weight),
                 "eligible": not reasons, "blocked_reasons": reasons,
+                "trip_id": trip_id,
+                "manifest_status": manifest_status,
+                "trip_status": trip_status,
             })
         return result
 

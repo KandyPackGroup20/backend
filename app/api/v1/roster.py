@@ -297,7 +297,7 @@ def assign_whole_orders(roster_id: int, request: CargoSelection,
 
 @router.get("/driver/my-deliveries")
 def get_driver_deliveries(
-    current_user: dict = Depends(require_roles(["DRIVER", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
+    current_user: dict = Depends(require_roles(["DRIVER", "ASSISTANT", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
 ):
     """Driver views their assigned delivery runs and order stops."""
     from app.core.database import get_db
@@ -305,12 +305,15 @@ def get_driver_deliveries(
         with conn.cursor() as cursor:
             params = []
             where_sql = "d.delivery_status <> 'CANCELLED'"
-            if current_user["role"] == "DRIVER":
+            if current_user["role"] in ("DRIVER", "ASSISTANT"):
                 cursor.execute("SELECT delivery_staff_id FROM delivery_staff WHERE user_id = %s", (current_user["user_id"],))
                 ds = cursor.fetchone()
                 if not ds:
                     return {"deliveries": []}
-                where_sql += " AND ra.driver_id = %s"
+                if current_user["role"] == "DRIVER":
+                    where_sql += " AND ra.driver_id = %s"
+                else:
+                    where_sql += " AND ra.assistant_id = %s"
                 params.append(ds["delivery_staff_id"])
 
             sql = f"""
@@ -358,7 +361,7 @@ def get_driver_deliveries(
 def complete_driver_delivery(
     delivery_id: int,
     payload: DriverDeliveryCompleteRequest = DriverDeliveryCompleteRequest(),
-    current_user: dict = Depends(require_roles(["DRIVER", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
+    current_user: dict = Depends(require_roles(["DRIVER", "ASSISTANT", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
 ):
     """Complete a specific delivery run stop and update the related customer order."""
     from app.core.database import get_db

@@ -31,13 +31,21 @@ async def lifespan(app: FastAPI):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-                cur.execute("""
-                    DELETE FROM customer_order 
-                    WHERE customer_id IN (SELECT customer_id FROM customer WHERE LOWER(email) = 'scriptspectra@gmail.com');
-                """)
-                cur.execute("DELETE FROM customer WHERE LOWER(email) = 'scriptspectra@gmail.com';")
-                cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = 'scriptspectra@gmail.com';")
-                cur.execute("DELETE FROM user WHERE LOWER(email) = 'scriptspectra@gmail.com';")
+                cur.execute("SELECT user_id FROM user WHERE LOWER(email) = 'scriptspectra@gmail.com';")
+                u_row = cur.fetchone()
+                if u_row:
+                    uid = u_row["user_id"]
+                    cur.execute("SELECT customer_id FROM customer WHERE user_id = %s;", (uid,))
+                    c_row = cur.fetchone()
+                    if c_row:
+                        cid = c_row["customer_id"]
+                        cur.execute("DELETE FROM order_item WHERE order_id IN (SELECT order_id FROM customer_order WHERE customer_id = %s);", (cid,))
+                        cur.execute("DELETE FROM customer_order WHERE customer_id = %s;", (cid,))
+                    cur.execute("DELETE FROM customer WHERE user_id = %s;", (uid,))
+                    cur.execute("DELETE FROM notification WHERE user_id = %s OR LOWER(recipient_email) = 'scriptspectra@gmail.com';", (uid,))
+                    cur.execute("DELETE FROM user WHERE user_id = %s;", (uid,))
+                else:
+                    cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = 'scriptspectra@gmail.com';")
                 cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
                 conn.commit()
         reset_login_failures('scriptspectra@gmail.com')
@@ -164,19 +172,30 @@ def purge_test_user(email: str = "scriptspectra@gmail.com"):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-                cur.execute("""
-                    DELETE FROM customer_order 
-                    WHERE customer_id IN (SELECT customer_id FROM customer WHERE LOWER(email) = %s);
-                """, (clean_email,))
-                cur.execute("DELETE FROM customer WHERE LOWER(email) = %s;", (clean_email,))
-                cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = %s;", (clean_email,))
-                cur.execute("DELETE FROM user WHERE LOWER(email) = %s;", (clean_email,))
+                cur.execute("SELECT user_id FROM user WHERE LOWER(email) = %s;", (clean_email,))
+                u_row = cur.fetchone()
+                deleted = False
+                if u_row:
+                    uid = u_row["user_id"]
+                    cur.execute("SELECT customer_id FROM customer WHERE user_id = %s;", (uid,))
+                    c_row = cur.fetchone()
+                    if c_row:
+                        cid = c_row["customer_id"]
+                        cur.execute("DELETE FROM order_item WHERE order_id IN (SELECT order_id FROM customer_order WHERE customer_id = %s);", (cid,))
+                        cur.execute("DELETE FROM customer_order WHERE customer_id = %s;", (cid,))
+                    cur.execute("DELETE FROM customer WHERE user_id = %s;", (uid,))
+                    cur.execute("DELETE FROM notification WHERE user_id = %s OR LOWER(recipient_email) = %s;", (uid, clean_email))
+                    cur.execute("DELETE FROM user WHERE user_id = %s;", (uid,))
+                    deleted = True
+                else:
+                    cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = %s;", (clean_email,))
                 cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
                 conn.commit()
         reset_login_failures(clean_email)
         return {
             "status": "SUCCESS",
             "message": f"Account '{clean_email}' successfully purged from the database.",
+            "user_found_and_deleted": deleted,
             "ready_for_test": True
         }
     except Exception as e:

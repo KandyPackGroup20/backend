@@ -96,6 +96,20 @@ def run_migrations():
                         except Exception as e:
                             logger.warning(f"Error checking/adding column {col} to delivery: {e}")
 
+                # 2ac. Ensure truck table has capacity_unit and station_id columns
+                cur.execute("SHOW TABLES LIKE 'truck'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("capacity_unit", "VARCHAR(16) NULL DEFAULT 'KG'"),
+                        ("station_id", "INT NULL"),
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM truck LIKE '{col}'")
+                            if not cur.fetchone():
+                                cur.execute(f"ALTER TABLE truck ADD COLUMN {col} {defn}")
+                        except Exception as e:
+                            logger.warning(f"Error checking/adding column {col} to truck: {e}")
+
                 # 2b. Ensure customer_order table has all consignment & routing columns
                 cur.execute("SHOW TABLES LIKE 'customer_order'")
                 if cur.fetchone():

@@ -25,33 +25,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[STARTUP DB INIT WARNING] Failed to ensure tables on startup: {e}")
 
-    try:
-        from app.core.database import get_db
-        from app.core.cache import reset_login_failures
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-                cur.execute("SELECT user_id FROM user WHERE LOWER(email) = 'scriptspectra@gmail.com';")
-                u_row = cur.fetchone()
-                if u_row:
-                    uid = u_row["user_id"]
-                    cur.execute("SELECT customer_id FROM customer WHERE user_id = %s;", (uid,))
-                    c_row = cur.fetchone()
-                    if c_row:
-                        cid = c_row["customer_id"]
-                        cur.execute("DELETE FROM order_item WHERE order_id IN (SELECT order_id FROM customer_order WHERE customer_id = %s);", (cid,))
-                        cur.execute("DELETE FROM customer_order WHERE customer_id = %s;", (cid,))
-                    cur.execute("DELETE FROM customer WHERE user_id = %s;", (uid,))
-                    cur.execute("DELETE FROM notification WHERE user_id = %s OR LOWER(recipient_email) = 'scriptspectra@gmail.com';", (uid,))
-                    cur.execute("DELETE FROM user WHERE user_id = %s;", (uid,))
-                else:
-                    cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = 'scriptspectra@gmail.com';")
-                cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
-                conn.commit()
-        reset_login_failures('scriptspectra@gmail.com')
-        print("[STARTUP] Purged scriptspectra@gmail.com test account from database.")
-    except Exception as e:
-        print(f"[STARTUP PURGE NOTICE] {e}")
+
 
     yield
 

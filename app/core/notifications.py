@@ -99,100 +99,100 @@ def log_and_dispatch_email(
     }
     _NOTIFICATION_DISPATCH_LOG.insert(0, entry)
 
-    # 1. Resend REST API live transmission (High-performance API)
-    resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
-    from_email = os.getenv("RESEND_FROM_EMAIL", "KandyPack Logistics <onboarding@resend.dev>").strip()
-    test_recipient = os.getenv("RESEND_TEST_RECIPIENT", "sachinigunasekara2004@gmail.com").strip()
-
     delivered_live = False
 
-    if resend_api_key:
-        def _post_resend(dest_email: str, note_header: str = "") -> Optional[str]:
-            subj = f"{note_header} {email_subject}" if note_header else email_subject
-            payload = {
-                "from": from_email,
-                "to": [dest_email],
-                "subject": subj,
-                "html": final_html,
-                "text": text_content
-            }
-            headers = {
-                "Authorization": f"Bearer {resend_api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KandyPack/2.0"
-            }
+    # 1. Primary: SMTP dispatch (e.g. Gmail SMTP via App Password, directly sends from sachinigunasekara2004@gmail.com to target user)
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+    smtp_user = os.getenv("SMTP_USER", "").strip()
+    smtp_pass = os.getenv("SMTP_PASSWORD", "").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+
+    if smtp_host and smtp_user and smtp_pass:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = email_subject
+            msg["From"] = f"KandyPack Logistics <{smtp_user}>"
+            msg["To"] = target_email
+            msg.attach(MIMEText(text_content, "plain"))
+            msg.attach(MIMEText(final_html, "html"))
+
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, [target_email], msg.as_string())
+            delivered_live = True
+            logger.info(f"[SMTP SUCCESS] Dispatched live email to {target_email} from {smtp_user}")
+        except Exception as smtp_err:
+            logger.warning(f"[SMTP FAILED] {smtp_err}. Falling back to Resend.")
+
+    # 2. Resend REST API (Runs if SMTP was not configured or failed)
+    if not delivered_live:
+        resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
+        from_email = os.getenv("RESEND_FROM_EMAIL", "KandyPack Logistics <onboarding@resend.dev>").strip()
+        test_recipient = os.getenv("RESEND_TEST_RECIPIENT", "sachinigunasekara2004@gmail.com").strip()
+
+        if resend_api_key:
+            def _post_resend(dest_email: str, note_header: str = "") -> Optional[str]:
+                subj = f"{note_header} {email_subject}" if note_header else email_subject
+                payload = {
+                    "from": from_email,
+                    "to": [dest_email],
+                    "subject": subj,
+                    "html": final_html,
+                    "text": text_content
+                }
+                headers = {
+                    "Authorization": f"Bearer {resend_api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KandyPack/2.0"
+                }
+
+                try:
+                    import httpx
+                    resp = httpx.post(
+                        "https://api.resend.com/emails",
+                        json=payload,
+                        headers=headers,
+                        timeout=10.0
+                    )
+                    if resp.status_code in (200, 201):
+                        return resp.json().get("id")
+                    else:
+                        err_msg = resp.text
+                        raise RuntimeError(f"HTTP {resp.status_code}: {err_msg}")
+                except ImportError:
+                    import json
+                    import urllib.request
+                    import urllib.error
+                    req = urllib.request.Request(
+                        "https://api.resend.com/emails",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers=headers,
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        res_json = json.loads(r.read().decode("utf-8"))
+                        return res_json.get("id")
 
             try:
-                import httpx
-                resp = httpx.post(
-                    "https://api.resend.com/emails",
-                    json=payload,
-                    headers=headers,
-                    timeout=10.0
-                )
-                if resp.status_code in (200, 201):
-                    return resp.json().get("id")
-                else:
-                    err_msg = resp.text
-                    raise RuntimeError(f"HTTP {resp.status_code}: {err_msg}")
-            except ImportError:
-                import json
-                import urllib.request
-                import urllib.error
-                req = urllib.request.Request(
-                    "https://api.resend.com/emails",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers=headers,
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    res_json = json.loads(r.read().decode("utf-8"))
-                    return res_json.get("id")
-
-        try:
-            msg_id = _post_resend(target_email)
-            delivered_live = True
-            logger.info(f"[RESEND SUCCESS] Live email delivered to {target_email} (ID: {msg_id})")
-        except Exception as resend_err:
-            err_str = str(resend_err)
-            # If on Resend unverified sandbox (onboarding@resend.dev), handle non-owner forward
-            if "testing emails to your own email address" in err_str or "403" in err_str:
-                if test_recipient and target_email.lower() != test_recipient.lower():
-                    try:
-                        msg_id = _post_resend(test_recipient, note_header=f"[Dev Test for {target_email}]")
-                        delivered_live = True
-                        logger.info(f"[RESEND LIVE FORWARD] Delivered to {test_recipient} for {target_email} (ID: {msg_id})")
-                    except Exception as fwd_err:
-                        logger.warning(f"[RESEND FORWARD ERROR] Failed redirecting to test recipient: {fwd_err}")
+                msg_id = _post_resend(target_email)
+                delivered_live = True
+                logger.info(f"[RESEND SUCCESS] Live email delivered to {target_email} (ID: {msg_id})")
+            except Exception as resend_err:
+                err_str = str(resend_err)
+                # If on Resend unverified sandbox (onboarding@resend.dev), handle non-owner forward
+                if "testing emails to your own email address" in err_str or "403" in err_str:
+                    if test_recipient and target_email.lower() != test_recipient.lower():
+                        try:
+                            msg_id = _post_resend(test_recipient, note_header=f"[Dev Test for {target_email}]")
+                            delivered_live = True
+                            logger.info(f"[RESEND LIVE FORWARD] Delivered to {test_recipient} for {target_email} (ID: {msg_id})")
+                        except Exception as fwd_err:
+                            logger.warning(f"[RESEND FORWARD ERROR] Failed redirecting to test recipient: {fwd_err}")
+                    else:
+                        logger.warning(f"[RESEND REST ERROR] {err_str}")
                 else:
                     logger.warning(f"[RESEND REST ERROR] {err_str}")
-            else:
-                logger.warning(f"[RESEND REST ERROR] {err_str}")
-
-    # 2. SMTP fallback if Resend was not executed or failed, and SMTP credentials are provided
-    if not delivered_live:
-        smtp_host = os.getenv("SMTP_HOST")
-        smtp_user = os.getenv("SMTP_USER")
-        smtp_pass = os.getenv("SMTP_PASSWORD")
-        smtp_port = int(os.getenv("SMTP_PORT", 587))
-
-        if smtp_host and smtp_user and smtp_pass:
-            try:
-                msg = MIMEMultipart("alternative")
-                msg["Subject"] = email_subject
-                msg["From"] = f"Kandypack Logistics <{smtp_user}>"
-                msg["To"] = target_email
-                msg.attach(MIMEText(text_content, "plain"))
-                msg.attach(MIMEText(final_html, "html"))
-
-                with smtplib.SMTP(smtp_host, smtp_port, timeout=8) as server:
-                    server.starttls()
-                    server.login(smtp_user, smtp_pass)
-                    server.sendmail(smtp_user, target_email, msg.as_string())
-                delivered_live = True
-                logger.info(f"[SMTP SUCCESS] Dispatched live email to {target_email}")
-            except Exception as smtp_err:
-                logger.warning(f"[SMTP FALLBACK FAILED] {smtp_err}")
 
     logger.info(f"[NOTIFICATION RECORDED] Type={notification_type} To={target_email} Subject={email_subject}")
     return True

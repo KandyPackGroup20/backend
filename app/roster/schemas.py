@@ -225,6 +225,9 @@ class CargoItem(FrozenModel):
     received_quantity: int
     wrong_destination: int
     unit_weight_kg: str | None
+    trip_id: int | None = None
+    trip_status: str | None = None
+    manifest_status: str | None = None
 
 
 class CargoOrder(FrozenModel):
@@ -246,6 +249,9 @@ class CargoOrder(FrozenModel):
     eligible: bool
     blocked_reasons: tuple[str, ...]
     items: tuple[CargoItem, ...]
+    trip_id: int | None = None
+    manifest_status: str | None = None
+    trip_status: str | None = None
 
 
 class DemandResponse(FrozenModel):

@@ -71,6 +71,31 @@ def run_migrations():
                     except Exception:
                         pass
 
+                # 2a. Ensure user table has station_id column
+                cur.execute("SHOW TABLES LIKE 'user'")
+                if cur.fetchone():
+                    try:
+                        cur.execute("SHOW COLUMNS FROM user LIKE 'station_id'")
+                        if not cur.fetchone():
+                            cur.execute("ALTER TABLE user ADD COLUMN station_id INT NULL")
+                    except Exception as e:
+                        logger.warning(f"Error checking/adding station_id to user: {e}")
+
+                # 2ab. Ensure delivery table has cargo_weight_kg and assignment columns
+                cur.execute("SHOW TABLES LIKE 'delivery'")
+                if cur.fetchone():
+                    for col, defn in [
+                        ("cargo_weight_kg", "DECIMAL(14,2) NULL DEFAULT 0.00"),
+                        ("assigned_at", "DATETIME NULL DEFAULT CURRENT_TIMESTAMP"),
+                        ("assigned_by", "INT NULL DEFAULT 1"),
+                    ]:
+                        try:
+                            cur.execute(f"SHOW COLUMNS FROM delivery LIKE '{col}'")
+                            if not cur.fetchone():
+                                cur.execute(f"ALTER TABLE delivery ADD COLUMN {col} {defn}")
+                        except Exception as e:
+                            logger.warning(f"Error checking/adding column {col} to delivery: {e}")
+
                 # 2b. Ensure customer_order table has all consignment & routing columns
                 cur.execute("SHOW TABLES LIKE 'customer_order'")
                 if cur.fetchone():

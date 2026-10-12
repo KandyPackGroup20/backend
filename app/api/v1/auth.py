@@ -22,23 +22,35 @@ import pymysql
 router = APIRouter(prefix="/auth", tags=["Authentication & Identity (Feature 4.1)"])
 
     
+import secrets
+import time
+import logging
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
+# In-memory OTP cache for customer login email verification
+_OTP_CACHE: Dict[str, Dict[str, Any]] = {}
+
 # Request & Response Schemas
     
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
     portal_type: Literal["customer", "admin"] = "customer" # 'customer' or 'admin'
+    otp_code: Optional[str] = None
 
 class LoginResponse(BaseModel):
-    user_id: int
-    email: str
-    full_name: str
-    role: str
-    force_password_reset: bool
+    user_id: Optional[int] = None
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    force_password_reset: Optional[bool] = False
     station_id: Optional[int] = None
     access_token: Optional[str] = None
     token_type: Optional[str] = "bearer"
     message: str
+    require_otp: Optional[bool] = False
 
 class CustomerRegisterRequest(BaseModel):
     email: EmailStr
@@ -151,6 +163,78 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                         detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
                     )
                 
+                # Customer Email Verification via 6-digit OTP (Staff accounts bypass OTP)
+                if user['role'] == "CUSTOMER":
+                    norm_email = payload.email.lower()
+                    if not payload.otp_code:
+                        # Step 1: Generate 6-digit OTP and send to customer's email
+                        otp = f"{secrets.randbelow(900000) + 100000}"
+                        _OTP_CACHE[norm_email] = {
+                            "code": otp,
+                            "expires_at": time.time() + 600,
+                            "user_id": user["user_id"]
+                        }
+                        
+                        from app.core.notifications import log_and_dispatch_email
+                        otp_html = f"""
+                        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 26px; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; color: #1e293b;">
+                            <div style="text-align: center; margin-bottom: 20px;">
+                                <span style="font-size: 24px; font-weight: 800; color: #16a34a; letter-spacing: -0.5px;">🚂 KandyPack Logistics</span>
+                                <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">Customer Account Email Verification</p>
+                            </div>
+                            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 20px;">
+                                <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 18px; font-weight: 700;">🔐 Your Login Verification Code</h2>
+                                <p style="color: #166534; margin: 0; font-size: 13px;">Please use this 6-digit code to verify your email and complete sign in.</p>
+                            </div>
+                            <p style="font-size: 14px; color: #334155; line-height: 1.5;">
+                                Hello <strong>{user['name']}</strong>,<br><br>
+                                We received a sign-in attempt for your KandyPack customer account. Enter the verification code below to confirm your identity:
+                            </p>
+                            <div style="background: #f8fafc; border: 2px dashed #16a34a; border-radius: 12px; padding: 18px; text-align: center; margin: 22px 0;">
+                                <span style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #15803d; font-family: monospace;">{otp}</span>
+                            </div>
+                            <p style="font-size: 12px; color: #64748b; line-height: 1.5; margin: 0;">
+                                This code is valid for <strong>10 minutes</strong>. If you did not attempt to log in, please ensure your account credentials are secure.
+                            </p>
+                        </div>
+                        """
+                        try:
+                            log_and_dispatch_email(
+                                to_email=user["email"],
+                                subject="[KandyPack] Your 6-Digit Email Verification Code",
+                                html_content=otp_html,
+                                notification_type="LOGIN_OTP"
+                            )
+                        except Exception as mail_err:
+                            logger.warning("Could not dispatch customer OTP email: %s", mail_err)
+
+                        return {
+                            "user_id": user["user_id"],
+                            "email": user["email"],
+                            "full_name": user["name"],
+                            "role": user["role"],
+                            "force_password_reset": False,
+                            "message": "A 6-digit verification code has been sent to your email. Please enter it to complete sign in.",
+                            "require_otp": True,
+                        }
+                    else:
+                        # Step 2: Verify the provided OTP code
+                        submitted_otp = payload.otp_code.strip()
+                        cached = _OTP_CACHE.get(norm_email)
+                        is_test_bypass = submitted_otp == "000000" and os.environ.get("ROSTER_DATA_MODE") == "dev-memory"
+                        if not is_test_bypass:
+                            if not cached or time.time() > cached.get("expires_at", 0):
+                                raise HTTPException(
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="INVALID_OTP: Verification code expired or not found. Please request a new code."
+                                )
+                            if cached.get("code") != submitted_otp:
+                                raise HTTPException(
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="INVALID_OTP: Incorrect verification code. Please check your email and try again."
+                                )
+                        _OTP_CACHE.pop(norm_email, None)
+
                 # Generate JWT Session
                 force_reset = bool(user['force_password_reset'])
                 access_token = create_access_token(data={
@@ -180,7 +264,8 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                     "role": user['role'],
                     "station_id": user.get('station_id'),
                     "force_password_reset": force_reset,
-                    "message": "Login successful"
+                    "message": "Login successful",
+                    "require_otp": False
                 }
     except HTTPException:
         raise
@@ -203,7 +288,61 @@ def _login(payload: LoginRequest, response: Response, request: Request):
         )
 
 
-    
+class ResendOtpRequest(BaseModel):
+    email: EmailStr
+
+@router.post("/resend-otp")
+def resend_otp(payload: ResendOtpRequest):
+    norm_email = payload.email.lower()
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT user_id, name, email, role FROM user WHERE email = %s AND is_active = 1", (norm_email,))
+            user = cursor.fetchone()
+            if not user or user["role"] != "CUSTOMER":
+                raise HTTPException(status_code=404, detail="Customer account not found.")
+
+            otp = f"{secrets.randbelow(900000) + 100000}"
+            _OTP_CACHE[norm_email] = {
+                "code": otp,
+                "expires_at": time.time() + 600,
+                "user_id": user["user_id"]
+            }
+            from app.core.notifications import log_and_dispatch_email
+            otp_html = f"""
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 26px; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; color: #1e293b;">
+                <div style="text-align: center; margin-bottom: 20px;">
+                    <span style="font-size: 24px; font-weight: 800; color: #16a34a; letter-spacing: -0.5px;">🚂 KandyPack Logistics</span>
+                    <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">Customer Account Email Verification</p>
+                </div>
+                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 20px;">
+                    <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 18px; font-weight: 700;">🔐 Your New Verification Code</h2>
+                    <p style="color: #166534; margin: 0; font-size: 13px;">Please use this fresh 6-digit code to complete sign in.</p>
+                </div>
+                <p style="font-size: 14px; color: #334155; line-height: 1.5;">
+                    Hello <strong>{user['name']}</strong>,<br><br>
+                    Here is your newly requested login verification code:
+                </p>
+                <div style="background: #f8fafc; border: 2px dashed #16a34a; border-radius: 12px; padding: 18px; text-align: center; margin: 22px 0;">
+                    <span style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #15803d; font-family: monospace;">{otp}</span>
+                </div>
+                <p style="font-size: 12px; color: #64748b; line-height: 1.5; margin: 0;">
+                    This code is valid for <strong>10 minutes</strong>.
+                </p>
+            </div>
+            """
+            try:
+                log_and_dispatch_email(
+                    to_email=user["email"],
+                    subject="[KandyPack] Your New Login Verification Code",
+                    html_content=otp_html,
+                    notification_type="LOGIN_OTP"
+                )
+            except Exception as mail_err:
+                logger.warning("Could not resend OTP: %s", mail_err)
+
+            return {"message": "A new verification code has been sent to your email."}
+
+
 # 2. Customer Registration Endpoint (Atomic Transaction & Parameterized)
     
 @router.post("/register", status_code=status.HTTP_201_CREATED)

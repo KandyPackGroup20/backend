@@ -24,6 +24,27 @@ async def lifespan(app: FastAPI):
         ensure_notification_table()
     except Exception as e:
         print(f"[STARTUP DB INIT WARNING] Failed to ensure tables on startup: {e}")
+
+    try:
+        from app.core.database import get_db
+        from app.core.cache import reset_login_failures
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+                cur.execute("""
+                    DELETE FROM customer_order 
+                    WHERE customer_id IN (SELECT customer_id FROM customer WHERE LOWER(email) = 'scriptspectra@gmail.com');
+                """)
+                cur.execute("DELETE FROM customer WHERE LOWER(email) = 'scriptspectra@gmail.com';")
+                cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = 'scriptspectra@gmail.com';")
+                cur.execute("DELETE FROM user WHERE LOWER(email) = 'scriptspectra@gmail.com';")
+                cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+                conn.commit()
+        reset_login_failures('scriptspectra@gmail.com')
+        print("[STARTUP] Purged scriptspectra@gmail.com test account from database.")
+    except Exception as e:
+        print(f"[STARTUP PURGE NOTICE] {e}")
+
     yield
 
 
@@ -125,5 +146,44 @@ def trigger_migrate():
     ]:
         reset_login_failures(email)
     return {"migrated": success}
+
+
+@app.api_route("/api/v1/auth/purge-test-user", methods=["GET", "POST"])
+def purge_test_user(email: str = "scriptspectra@gmail.com"):
+    """Purges the test customer account from cloud MySQL to allow testing OTP verification & re-registration."""
+    clean_email = email.strip().lower()
+    if clean_email != "scriptspectra@gmail.com":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Only scriptspectra@gmail.com test account purge is authorized."}
+        )
+
+    from app.core.database import get_db
+    from app.core.cache import reset_login_failures
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+                cur.execute("""
+                    DELETE FROM customer_order 
+                    WHERE customer_id IN (SELECT customer_id FROM customer WHERE LOWER(email) = %s);
+                """, (clean_email,))
+                cur.execute("DELETE FROM customer WHERE LOWER(email) = %s;", (clean_email,))
+                cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = %s;", (clean_email,))
+                cur.execute("DELETE FROM user WHERE LOWER(email) = %s;", (clean_email,))
+                cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+                conn.commit()
+        reset_login_failures(clean_email)
+        return {
+            "status": "SUCCESS",
+            "message": f"Account '{clean_email}' successfully purged from the database.",
+            "ready_for_test": True
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "ERROR", "message": f"Database purge failed: {str(e)}"}
+        )
+
 
 

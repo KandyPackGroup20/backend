@@ -131,13 +131,13 @@ def trigger_migrate():
 
 
 @app.api_route("/api/v1/auth/purge-test-user", methods=["GET", "POST"])
-def purge_test_user(email: str = "scriptspectra@gmail.com"):
-    """Purges the test customer account from cloud MySQL to allow testing OTP verification & re-registration."""
+def purge_test_user(email: str):
+    """Purges a customer account from MySQL to allow testing OTP verification & re-registration."""
     clean_email = email.strip().lower()
-    if clean_email != "scriptspectra@gmail.com":
+    if clean_email.endswith("@kandypack.lk") or clean_email == "customer1@gmail.com":
         return JSONResponse(
             status_code=400,
-            content={"error": "Only scriptspectra@gmail.com test account purge is authorized."}
+            content={"error": "Internal staff and default seeded accounts cannot be purged."}
         )
 
     from app.core.database import get_db

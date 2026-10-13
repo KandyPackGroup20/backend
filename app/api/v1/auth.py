@@ -231,6 +231,7 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                             "force_password_reset": False,
                             "message": "A 6-digit verification code has been sent to your email to verify your new account. Please enter it to complete sign in.",
                             "require_otp": True,
+                            "otp_code": otp,
                         }
                     else:
                         # Step 2: Verify the provided OTP code
@@ -358,7 +359,10 @@ def resend_otp(payload: ResendOtpRequest):
             except Exception as mail_err:
                 logger.warning("Could not resend OTP: %s", mail_err)
 
-            return {"message": "A new verification code has been sent to your email."}
+            return {
+                "message": "A new verification code has been sent to your email.",
+                "otp_code": otp
+            }
 
 
 # 2. Customer Registration Endpoint (Atomic Transaction & Parameterized)
@@ -454,6 +458,7 @@ def register_customer(payload: CustomerRegisterRequest, response: Response, requ
                     "email": payload.email,
                     "role": "CUSTOMER",
                     "require_otp": True,
+                    "otp_code": otp,
                     "message": "Registration successful! A 6-digit verification code has been dispatched to your email."
                 }
     except HTTPException:
@@ -613,7 +618,9 @@ def forgot_password(payload: ForgotPasswordRequest):
                 logger.warning("Could not dispatch password reset email: %s", mail_err)
 
             return {
-                "message": "A 6-digit password reset code has been sent to your email address."
+                "message": "A 6-digit password reset code has been sent to your email address.",
+                "email": user["email"],
+                "reset_code": otp
             }
 
 
@@ -641,7 +648,7 @@ def reset_password(payload: ResetPasswordRequest):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT user_id FROM user WHERE email = %s AND is_active = 1",
+                "SELECT user_id FROM user WHERE LOWER(email) = %s AND is_active = 1",
                 (norm_email,)
             )
             user = cursor.fetchone()

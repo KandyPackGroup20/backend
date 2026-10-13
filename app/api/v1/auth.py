@@ -539,7 +539,7 @@ def verify_registration_otp(payload: VerifyOtpRequest, response: Response, reque
 
 
 @router.get("/latest-otp")
-def get_latest_otp(email: str = "scriptspectra@gmail.com"):
+def get_latest_otp(email: str):
     """Returns active verification code for testing and demonstration."""
     norm_email = email.lower().strip()
     cached = _OTP_CACHE.get(norm_email)
@@ -663,7 +663,7 @@ def reset_password(payload: ResetPasswordRequest):
 
 
 @router.get("/latest-reset-otp")
-def get_latest_reset_otp(email: str = "scriptspectra@gmail.com"):
+def get_latest_reset_otp(email: str):
     """Returns active password reset code for automated testing and verification."""
     norm_email = email.lower().strip()
     cached = _RESET_OTP_CACHE.get(norm_email)

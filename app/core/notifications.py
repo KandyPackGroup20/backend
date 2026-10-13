@@ -137,15 +137,13 @@ def log_and_dispatch_email(
     if not delivered_live:
         resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
         from_email = os.getenv("RESEND_FROM_EMAIL", "KandyPack Logistics <onboarding@resend.dev>").strip()
-        test_recipient = os.getenv("RESEND_TEST_RECIPIENT", "sachinigunasekara2004@gmail.com").strip()
 
         if resend_api_key:
-            def _post_resend(dest_email: str, note_header: str = "") -> Optional[str]:
-                subj = f"{note_header} {email_subject}" if note_header else email_subject
+            def _post_resend(dest_email: str) -> Optional[str]:
                 payload = {
                     "from": from_email,
                     "to": [dest_email],
-                    "subject": subj,
+                    "subject": email_subject,
                     "html": final_html,
                     "text": text_content
                 }
@@ -187,20 +185,7 @@ def log_and_dispatch_email(
                 delivered_live = True
                 logger.info(f"[RESEND SUCCESS] Live email delivered to {target_email} (ID: {msg_id})")
             except Exception as resend_err:
-                err_str = str(resend_err)
-                # If on Resend unverified sandbox (onboarding@resend.dev), handle non-owner forward
-                if "testing emails to your own email address" in err_str or "403" in err_str:
-                    if test_recipient and target_email.lower() != test_recipient.lower():
-                        try:
-                            msg_id = _post_resend(test_recipient, note_header=f"[Dev Test for {target_email}]")
-                            delivered_live = True
-                            logger.info(f"[RESEND LIVE FORWARD] Delivered to {test_recipient} for {target_email} (ID: {msg_id})")
-                        except Exception as fwd_err:
-                            logger.warning(f"[RESEND FORWARD ERROR] Failed redirecting to test recipient: {fwd_err}")
-                    else:
-                        logger.warning(f"[RESEND REST ERROR] {err_str}")
-                else:
-                    logger.warning(f"[RESEND REST ERROR] {err_str}")
+                logger.warning(f"[EMAIL DISPATCH FAILED] Could not send email to {target_email}: {resend_err}")
 
     logger.info(f"[NOTIFICATION RECORDED] Type={notification_type} To={target_email} Subject={email_subject}")
     return True

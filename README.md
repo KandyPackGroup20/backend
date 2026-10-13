@@ -81,7 +81,7 @@ SESSION_COOKIE_SECURE=false
 REDIS_HOST=localhost
 REDIS_PORT=6379
 
-# Email Transmission (Primary: Gmail SMTP)
+# Email Transmission (Primary: Gmail SMTP Carrier)
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=sachinigunasekara2004@gmail.com
@@ -90,7 +90,6 @@ SMTP_PASSWORD=your_16_char_google_app_password
 # Email Transmission (Fallback: Resend API)
 RESEND_API_KEY=re_your_resend_api_key
 RESEND_FROM_EMAIL=KandyPack Logistics <onboarding@resend.dev>
-RESEND_TEST_RECIPIENT=sachinigunasekara2004@gmail.com
 ```
 
 ---
@@ -130,11 +129,11 @@ To ensure high deliverability without domain verification barriers, the platform
 
 1. **Primary Carrier — Gmail SMTP (`smtp.gmail.com:587`)**:
    - Uses `STARTTLS` encryption with standard 16-character Google App Passwords.
-   - Compliant with **RFC 5322**: attaches standard `Date`, `Message-ID`, `Reply-To`, and multipart HTML/plaintext bodies to bypass spam filters.
-   - Allows sending directly from personal Google accounts (e.g. `sachinigunasekara2004@gmail.com`) to any user's real inbox without requiring a verified domain.
+   - Compliant with **RFC 5322**: dynamically routes each message to the exact recipient email supplied during registration, sign-in, or password recovery.
+   - Delivers directly to any valid inbox (Gmail, Yahoo, Outlook, custom corporate domains) without domain sandbox restrictions.
 2. **Fallback Carrier — Resend REST API (`api.resend.com`)**:
-   - Automatically engaged if SMTP credentials are omitted or network transmission fails.
-   - Includes automatic sandbox rerouting for development environments.
+   - Engaged as secondary backup if SMTP connectivity is temporarily unreachable.
+   - Sends directly to the target recipient.
 
 ---
 

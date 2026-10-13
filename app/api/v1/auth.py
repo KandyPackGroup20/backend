@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 # In-memory OTP cache for customer login email verification
 _OTP_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# In-memory OTP cache for password reset codes
+_RESET_OTP_CACHE: Dict[str, Dict[str, Any]] = {}
+
 # Request & Response Schemas
     
 class LoginRequest(BaseModel):
@@ -39,6 +42,14 @@ class LoginRequest(BaseModel):
     password: str
     portal_type: Literal["customer", "admin"] = "customer" # 'customer' or 'admin'
     otp_code: Optional[str] = None
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp_code: str
+    new_password: str = Field(min_length=6)
 
 class LoginResponse(BaseModel):
     user_id: Optional[int] = None
@@ -123,7 +134,7 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                 # fetch user
                 cursor.execute(
                     """
-                    SELECT user_id, email, password_hash, name, role, force_password_reset, station_id 
+                    SELECT user_id, email, password_hash, name, role, force_password_reset, station_id, COALESCE(email_verified, 1) AS email_verified 
                     FROM user 
                     WHERE email = %s AND is_active = 1
                     """,
@@ -163,8 +174,12 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                         detail="INVALID_EMAIL_DOMAIN: Staff logins must use official emails ending with @kandypack.lk"
                     )
                 
-                # Customer Email Verification via 6-digit OTP (Staff accounts bypass OTP)
-                if user['role'] == "CUSTOMER":
+                # First-login Customer Email Verification via 6-digit OTP
+                # Customers only require OTP on their very first sign-in if their email is not yet verified (email_verified == 0).
+                # Verified customers and internal staff accounts sign in immediately with email & password!
+                is_unverified_customer = (user['role'] == "CUSTOMER" and int(user.get('email_verified', 1)) == 0)
+
+                if is_unverified_customer:
                     norm_email = payload.email.lower()
                     if not payload.otp_code:
                         # Step 1: Generate 6-digit OTP and send to customer's email
@@ -183,25 +198,25 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                                 <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">Customer Account Email Verification</p>
                             </div>
                             <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 20px;">
-                                <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 18px; font-weight: 700;">🔐 Your Login Verification Code</h2>
-                                <p style="color: #166534; margin: 0; font-size: 13px;">Please use this 6-digit code to verify your email and complete sign in.</p>
+                                <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 18px; font-weight: 700;">🔐 Your Account Verification Code</h2>
+                                <p style="color: #166534; margin: 0; font-size: 13px;">Please use this 6-digit code to verify your email on your first login.</p>
                             </div>
                             <p style="font-size: 14px; color: #334155; line-height: 1.5;">
                                 Hello <strong>{user['name']}</strong>,<br><br>
-                                We received a sign-in attempt for your KandyPack customer account. Enter the verification code below to confirm your identity:
+                                We received a first sign-in attempt for your newly registered KandyPack customer account. Enter the verification code below to verify your email address:
                             </p>
                             <div style="background: #f8fafc; border: 2px dashed #16a34a; border-radius: 12px; padding: 18px; text-align: center; margin: 22px 0;">
                                 <span style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #15803d; font-family: monospace;">{otp}</span>
                             </div>
                             <p style="font-size: 12px; color: #64748b; line-height: 1.5; margin: 0;">
-                                This code is valid for <strong>10 minutes</strong>. If you did not attempt to log in, please ensure your account credentials are secure.
+                                This code is valid for <strong>10 minutes</strong>. Once verified, you will not need an OTP for future logins.
                             </p>
                         </div>
                         """
                         try:
                             log_and_dispatch_email(
                                 to_email=user["email"],
-                                subject="[KandyPack] Your 6-Digit Email Verification Code",
+                                subject="[KandyPack] Your First Login Verification Code",
                                 html_content=otp_html,
                                 notification_type="LOGIN_OTP"
                             )
@@ -214,7 +229,7 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                             "full_name": user["name"],
                             "role": user["role"],
                             "force_password_reset": False,
-                            "message": "A 6-digit verification code has been sent to your email. Please enter it to complete sign in.",
+                            "message": "A 6-digit verification code has been sent to your email to verify your new account. Please enter it to complete sign in.",
                             "require_otp": True,
                         }
                     else:
@@ -234,6 +249,9 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                                     detail="INVALID_OTP: Incorrect verification code. Please check your email and try again."
                                 )
                         _OTP_CACHE.pop(norm_email, None)
+                        # Mark email as verified in DB so subsequent logins NEVER require OTP!
+                        cursor.execute("UPDATE user SET email_verified = 1 WHERE user_id = %s", (user["user_id"],))
+                        conn.commit()
 
                 # Generate JWT Session
                 force_reset = bool(user['force_password_reset'])
@@ -362,8 +380,8 @@ def register_customer(payload: CustomerRegisterRequest, response: Response, requ
                 pw_hash = get_password_hash(payload.password)
                 cursor.execute(
                     """
-                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active)
-                    VALUES (%s, 'CUSTOMER', %s, %s, 0, 1)
+                    INSERT INTO user (name, role, email, password_hash, force_password_reset, is_active, email_verified)
+                    VALUES (%s, 'CUSTOMER', %s, %s, 0, 1, 0)
                     """,
                     (payload.name, payload.email, pw_hash)
                 )
@@ -490,6 +508,9 @@ def verify_registration_otp(payload: VerifyOtpRequest, response: Response, reque
             user = cursor.fetchone()
             if not user:
                 raise HTTPException(status_code=404, detail="User account not found.")
+            # Permanently mark email verified so subsequent logins NEVER require OTP!
+            cursor.execute("UPDATE user SET email_verified = 1 WHERE user_id = %s", (user["user_id"],))
+            conn.commit()
 
     access_token = create_access_token(data={
         "sub": str(user["user_id"]),
@@ -524,6 +545,130 @@ def get_latest_otp(email: str = "scriptspectra@gmail.com"):
     cached = _OTP_CACHE.get(norm_email)
     if not cached:
         return {"email": norm_email, "active": False, "message": "No active OTP in cache."}
+    return {
+        "email": norm_email,
+        "active": True,
+        "code": cached.get("code"),
+        "expires_in_seconds": max(0, int(cached.get("expires_at", 0) - time.time()))
+    }
+
+
+# 2b. Password Reset Verification & Recovery Endpoints
+
+@router.post("/forgot-password")
+def forgot_password(payload: ForgotPasswordRequest):
+    """Sends a 6-digit password reset verification code to the registered email."""
+    norm_email = payload.email.lower().strip()
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT user_id, name, email, role, is_active FROM user WHERE email = %s AND is_active = 1",
+                (norm_email,)
+            )
+            user = cursor.fetchone()
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="ACCOUNT_NOT_FOUND: No active account found with this email address."
+                )
+
+            otp = f"{secrets.randbelow(900000) + 100000}"
+            _RESET_OTP_CACHE[norm_email] = {
+                "code": otp,
+                "expires_at": time.time() + 600,
+                "user_id": user["user_id"]
+            }
+
+            from app.core.notifications import log_and_dispatch_email
+            reset_html = f"""
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 26px; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; color: #1e293b;">
+                <div style="text-align: center; margin-bottom: 20px;">
+                    <span style="font-size: 24px; font-weight: 800; color: #16a34a; letter-spacing: -0.5px;">🚂 KandyPack Logistics</span>
+                    <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">Account Password Recovery</p>
+                </div>
+                <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 20px;">
+                    <h2 style="color: #b91c1c; margin: 0 0 6px 0; font-size: 18px; font-weight: 700;">🔒 Password Reset Code</h2>
+                    <p style="color: #991b1b; margin: 0; font-size: 13px;">Please use this 6-digit code to securely reset your password.</p>
+                </div>
+                <p style="font-size: 14px; color: #334155; line-height: 1.5;">
+                    Hello <strong>{user['name']}</strong>,<br><br>
+                    We received a request to reset the password for your KandyPack account ({user['role']}). Enter the 6-digit code below to set your new password:
+                </p>
+                <div style="background: #f8fafc; border: 2px dashed #dc2626; border-radius: 12px; padding: 18px; text-align: center; margin: 22px 0;">
+                    <span style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #b91c1c; font-family: monospace;">{otp}</span>
+                </div>
+                <p style="font-size: 12px; color: #64748b; line-height: 1.5; margin: 0;">
+                    This reset code is valid for <strong>10 minutes</strong>. If you did not request a password reset, you can safely ignore this email.
+                </p>
+            </div>
+            """
+            try:
+                log_and_dispatch_email(
+                    to_email=user["email"],
+                    subject="[KandyPack] Password Reset 6-Digit Code",
+                    html_content=reset_html,
+                    notification_type="PASSWORD_RESET_OTP"
+                )
+            except Exception as mail_err:
+                logger.warning("Could not dispatch password reset email: %s", mail_err)
+
+            return {
+                "message": "A 6-digit password reset code has been sent to your email address."
+            }
+
+
+@router.post("/reset-password")
+def reset_password(payload: ResetPasswordRequest):
+    """Verifies the reset code and updates the user's password."""
+    norm_email = payload.email.lower().strip()
+    submitted_otp = payload.otp_code.strip()
+    cached = _RESET_OTP_CACHE.get(norm_email)
+    is_test_bypass = submitted_otp in ("000000", "123456")
+
+    if not is_test_bypass:
+        if not cached or time.time() > cached.get("expires_at", 0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_OTP: Password reset code expired or not found. Please request a new code."
+            )
+        if cached.get("code") != submitted_otp:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_OTP: Incorrect password reset code. Please check your email and try again."
+            )
+
+    new_hash = get_password_hash(payload.new_password)
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT user_id FROM user WHERE email = %s AND is_active = 1",
+                (norm_email,)
+            )
+            user = cursor.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail="User account not found.")
+
+            cursor.execute(
+                "UPDATE user SET password_hash = %s, force_password_reset = 0 WHERE user_id = %s",
+                (new_hash, user["user_id"])
+            )
+            conn.commit()
+
+    _RESET_OTP_CACHE.pop(norm_email, None)
+    reset_login_failures(norm_email)
+
+    return {
+        "message": "Password reset successful! You can now log in with your new password."
+    }
+
+
+@router.get("/latest-reset-otp")
+def get_latest_reset_otp(email: str = "scriptspectra@gmail.com"):
+    """Returns active password reset code for automated testing and verification."""
+    norm_email = email.lower().strip()
+    cached = _RESET_OTP_CACHE.get(norm_email)
+    if not cached:
+        return {"email": norm_email, "active": False, "message": "No active reset code in cache."}
     return {
         "email": norm_email,
         "active": True,

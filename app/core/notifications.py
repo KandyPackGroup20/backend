@@ -102,10 +102,13 @@ def log_and_dispatch_email(
     delivered_live = False
 
     # 1. Primary: SMTP dispatch (e.g. Gmail SMTP via App Password, directly sends from sachinigunasekara2004@gmail.com to target user)
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
-    smtp_user = os.getenv("SMTP_USER", "").strip()
-    smtp_pass = os.getenv("SMTP_PASSWORD", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_host = (os.getenv("SMTP_HOST") or "").strip() or "smtp.gmail.com"
+    smtp_user = (os.getenv("SMTP_USER") or "").strip() or "sachinigunasekara2004@gmail.com"
+    smtp_pass = (os.getenv("SMTP_PASSWORD") or "").strip() or "jwlojstktcdpaehw"
+    try:
+        smtp_port = int((os.getenv("SMTP_PORT") or "").strip() or "587")
+    except Exception:
+        smtp_port = 587
 
     if smtp_host and smtp_user and smtp_pass:
         try:

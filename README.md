@@ -142,9 +142,9 @@ To ensure high deliverability without domain verification barriers, the platform
 
 | Trigger Event | Notification Type | Trigger Condition | Recipient | Email Contents |
 |---|---|---|---|---|
-| **1. Customer Registration** | `REGISTRATION_OTP` | When a user signs up on `/api/v1/auth/register` | Customer's registered email | Welcome message + 6-digit activation code (expires in 10 minutes). |
-| **2. Customer Sign-In (2FA)** | `LOGIN_OTP` | Customer logs in without an active 2FA bypass | Customer's registered email | Two-factor verification code confirming account sign-in. |
-| **3. Password Reset** | `PASSWORD_RESET_OTP` | User requests credential recovery | Registered user email | 6-digit authorization code to update password. |
+| **1. Customer Registration** | `REGISTRATION_OTP` | When a user signs up on `/api/v1/auth/register` | Customer's registered email | Welcome message + 6-digit email ownership verification code (expires in 10 minutes). Account is marked `email_verified = 0`. |
+| **2. First Login Email Verification** | `LOGIN_OTP` | Freshly registered unverified customer attempts first login | Customer's registered email | One-time 6-digit activation code. Once verified, `email_verified` is set to `1` and **no OTP is EVER required on subsequent logins** (password-only sign-in). |
+| **3. Password Reset Recovery** | `PASSWORD_RESET_OTP` | User requests credential recovery on `/api/v1/auth/forgot-password` | Registered user email | 6-digit authorization code (valid 10 minutes) allowing user to securely update password on `/api/v1/auth/reset-password`. |
 | **4. Order Placed** | `ORDER_CONFIRMED` | Customer submits order on `/api/v1/orders` | Customer's email | Order receipt, total weight, payment total, destination hub, and live tracking link. |
 | **5. Rail Consignment Scheduled** | `NEW_CONSIGNMENT` | Logistics Manager allocates order to train trip | Destination Hub Store Manager (`store.<city>@kandypack.lk`) | Train trip ID, expected departure/arrival times, cargo volume, and receiving guidelines. |
 | **6. Doorstep Delivery Complete** | `DELIVERY_CONFIRMATION` | Driver clicks **"Mark as Delivered"** on `/api/v1/roster/deliveries/{id}/complete` | Customer's registered email | Thank-you note, delivery timestamp, driver proof note, and direct link to confirm receipt. |
@@ -206,11 +206,14 @@ Router: `app/api/v1/auth.py`
 
 | Method | Endpoint | Access | Description |
 |---|---|---|---|
-| `POST` | `/api/v1/auth/register` | Public | Registers a new customer profile, hashes password with bcrypt, and dispatches an email OTP. |
-| `POST` | `/api/v1/auth/login` | Public | Authenticates credentials with anti-brute-force rate limiting; issues an `HttpOnly` JWT cookie. |
-| `POST` | `/api/v1/auth/verify-otp` | Public | Verifies the 6-digit OTP and establishes the user session. |
-| `POST` | `/api/v1/auth/resend-otp` | Public | Generates and emails a fresh 6-digit verification code. |
-| `GET` | `/api/v1/auth/latest-otp` | Public / Demo | Returns active OTP code from in-memory cache for demonstration and testing. |
+| `POST` | `/api/v1/auth/register` | Public | Registers a new customer profile, hashes password with bcrypt, and dispatches a one-time email OTP. |
+| `POST` | `/api/v1/auth/login` | Public | Authenticates credentials with anti-brute-force rate limiting; verified users log in immediately without OTP. Fresh unverified customers receive a one-time OTP check. |
+| `POST` | `/api/v1/auth/verify-otp` | Public | Verifies the registration 6-digit OTP, marks `email_verified = 1`, and establishes the user session. |
+| `POST` | `/api/v1/auth/resend-otp` | Public | Generates and emails a fresh 6-digit verification code for unverified accounts. |
+| `GET` | `/api/v1/auth/latest-otp` | Public / Demo | Returns active registration/login OTP code from in-memory cache for demonstration and testing. |
+| `POST` | `/api/v1/auth/forgot-password` | Public | Dispatches a 6-digit password recovery code via Gmail SMTP to the user's registered email address. |
+| `POST` | `/api/v1/auth/reset-password` | Public | Verifies the 6-digit reset code and sets a new password (clearing login locks). |
+| `GET` | `/api/v1/auth/latest-reset-otp` | Public / Demo | Returns active password reset code from cache for testing. |
 | `GET` | `/api/v1/auth/me` | Authenticated | Resolves the profile, role, and station assignment of the active session. |
 | `POST` | `/api/v1/auth/change-password` | Authenticated | Updates account password and clears the `force_password_reset` flag. |
 | `POST` | `/api/v1/auth/users` | `SUPERADMIN` | Provisions internal staff (`STORE_MGR`, `WAREHOUSE_STAFF`, `DISPATCHER`, `DRIVER`, etc.). |

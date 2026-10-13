@@ -71,15 +71,18 @@ def run_migrations():
                     except Exception:
                         pass
 
-                # 2a. Ensure user table has station_id column
+                # 2a. Ensure user table has station_id and email_verified columns
                 cur.execute("SHOW TABLES LIKE 'user'")
                 if cur.fetchone():
                     try:
                         cur.execute("SHOW COLUMNS FROM user LIKE 'station_id'")
                         if not cur.fetchone():
                             cur.execute("ALTER TABLE user ADD COLUMN station_id INT NULL")
+                        cur.execute("SHOW COLUMNS FROM user LIKE 'email_verified'")
+                        if not cur.fetchone():
+                            cur.execute("ALTER TABLE user ADD COLUMN email_verified TINYINT DEFAULT 1")
                     except Exception as e:
-                        logger.warning(f"Error checking/adding station_id to user: {e}")
+                        logger.warning(f"Error checking/adding station_id or email_verified to user: {e}")
 
                 # 2ab. Ensure delivery table has cargo_weight_kg and assignment columns
                 cur.execute("SHOW TABLES LIKE 'delivery'")

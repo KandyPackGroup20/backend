@@ -109,10 +109,14 @@ def log_and_dispatch_email(
 
     if smtp_host and smtp_user and smtp_pass:
         try:
+            from email.utils import formatdate, make_msgid
             msg = MIMEMultipart("alternative")
             msg["Subject"] = email_subject
             msg["From"] = f"KandyPack Logistics <{smtp_user}>"
             msg["To"] = target_email
+            msg["Reply-To"] = smtp_user
+            msg["Date"] = formatdate(localtime=True)
+            msg["Message-ID"] = make_msgid(domain="gmail.com")
             msg.attach(MIMEText(text_content, "plain"))
             msg.attach(MIMEText(final_html, "html"))
 
@@ -120,6 +124,7 @@ def log_and_dispatch_email(
                 server.starttls()
                 server.login(smtp_user, smtp_pass)
                 server.sendmail(smtp_user, [target_email], msg.as_string())
+            print(f"[SMTP DISPATCH SUCCESS] Live email delivered from {smtp_user} to {target_email}")
             delivered_live = True
             logger.info(f"[SMTP SUCCESS] Dispatched live email to {target_email} from {smtp_user}")
         except Exception as smtp_err:

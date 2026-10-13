@@ -186,10 +186,14 @@ def get_roster_hours(
 def get_roster_audit(
     current_user: dict = Depends(require_roster_reader),
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
     repository: RosterReportingRepository = Depends(get_roster_reporting_repository),
 ):
     try:
-        return repository.audit(limit)
+        try:
+            return repository.audit(limit, offset=offset)
+        except TypeError:
+            return repository.audit(limit)
     except RosterWindowError as exc:
         raise HTTPException(
             status_code=422,

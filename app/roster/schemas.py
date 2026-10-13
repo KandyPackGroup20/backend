@@ -192,6 +192,7 @@ class AuditAttempt(FrozenModel):
 class AuditResponse(FrozenModel):
     attempts: tuple[AuditAttempt, ...]
     meta: MySQLWriteMeta = MySQLWriteMeta()
+    total_count: int | None = None
 
 
 class CargoSelection(FrozenModel):

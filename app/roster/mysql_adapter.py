@@ -429,12 +429,18 @@ class MySQLRosterAdapter:
                 week_start=week_start, week_end=week_end, hours=tuple(hours), meta=MySQLWriteMeta(),
             )
 
-    def audit(self, limit: int) -> AuditResponse:
+    def audit(self, limit: int, offset: int = 0) -> AuditResponse:
         zone = _colombo()
         if type(limit) is not int or not 1 <= limit <= 100:
             raise RosterWindowError("Audit limit must be an integer from 1 through 100.")
+        if type(offset) is not int or offset < 0:
+            raise RosterWindowError("Audit offset must be a non-negative integer.")
         with _snapshot() as cursor:
-            cursor.execute(AUDIT_SQL, ("ASSIGN_ROSTER", limit))
+            if offset > 0:
+                paged_sql = AUDIT_SQL.strip() + " OFFSET %s"
+                cursor.execute(paged_sql, ("ASSIGN_ROSTER", limit, offset))
+            else:
+                cursor.execute(AUDIT_SQL, ("ASSIGN_ROSTER", limit))
             attempts = tuple(_audit_attempt(row, zone) for row in cursor.fetchall())
             return AuditResponse(attempts=attempts, meta=MySQLWriteMeta())
 

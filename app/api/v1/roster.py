@@ -391,27 +391,55 @@ def complete_driver_delivery(
                     VALUES ('DELIVERED', %s, %s, %s)
                 """, (deliv["order_id"], current_user.get("user_id"), now))
 
-                # Send notification & thank-you email
+                # Query customer & recipient details
                 cursor.execute("""
                     SELECT 
-                        u.email, u.user_id, u.name AS user_name,
+                        co.order_id,
+                        co.customer_id,
+                        co.recipient_name,
+                        co.recipient_phone,
+                        co.delivery_address,
                         c.customer_name,
-                        co.recipient_name, co.recipient_phone, co.delivery_address
-                    FROM customer c 
-                    JOIN `user` u ON u.user_id = c.user_id 
-                    JOIN customer_order co ON co.customer_id = c.customer_id
-                    WHERE c.customer_id = %s AND co.order_id = %s
-                """, (deliv["customer_id"], deliv["order_id"]))
+                        u.user_id,
+                        u.email,
+                        u.name AS user_name
+                    FROM customer_order co
+                    LEFT JOIN customer c ON c.customer_id = co.customer_id
+                    LEFT JOIN `user` u ON u.user_id = c.user_id
+                    WHERE co.order_id = %s
+                """, (deliv["order_id"],))
                 cust_u = cursor.fetchone()
-                if cust_u:
-                    proof_text = payload.proof_reference or "Handed over to recipient, signed."
+
+                # Fallback check if email was missing from order-customer link
+                if not (cust_u and cust_u.get("email")) and deliv.get("customer_id"):
+                    cursor.execute("""
+                        SELECT u.email, u.user_id, u.name AS user_name
+                        FROM customer c
+                        JOIN `user` u ON u.user_id = c.user_id
+                        WHERE c.customer_id = %s
+                    """, (deliv["customer_id"],))
+                    extra_u = cursor.fetchone()
+                    if extra_u:
+                        if not cust_u:
+                            cust_u = {}
+                        cust_u["email"] = extra_u.get("email")
+                        cust_u["user_id"] = extra_u.get("user_id")
+                        cust_u["user_name"] = extra_u.get("user_name")
+
+                proof_text = payload.proof_reference or "Handed over to recipient, signed."
+                target_email = (cust_u.get("email") or "").strip().lower() if cust_u else ""
+                recipient_disp_name = (cust_u.get("recipient_name") or cust_u.get("customer_name") or cust_u.get("user_name") or "Valued Customer") if cust_u else "Valued Customer"
+                deliv_address = (cust_u.get("delivery_address") or "Your registered delivery address") if cust_u else "Your registered delivery address"
+
+                email_dispatched = False
+                if target_email:
                     try:
                         cursor.execute("""
                             INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
                             VALUES (%s, %s, 'DELIVERY_UPDATE', 'Consignment Delivered to Doorstep', %s, %s, 0, %s)
                         """, (
-                            cust_u["user_id"], cust_u["email"],
-                            f"Your order #{deliv['order_id']} has been delivered to {cust_u.get('delivery_address', 'your doorstep')}. Proof: {proof_text}. Please inspect and confirm receipt.",
+                            cust_u.get("user_id"), target_email,
+                            f"Your order #{deliv['order_id']} has been delivered to {deliv_address}. Proof: {proof_text}. Please inspect and confirm receipt.",
                             deliv["order_id"], now
                         ))
                     except Exception as notif_err:
@@ -419,28 +447,28 @@ def complete_driver_delivery(
 
                     # Dispatch customer thank-you email via notification service
                     from app.core.notifications import log_and_dispatch_email
-                    recipient_disp_name = cust_u.get("recipient_name") or cust_u.get("customer_name") or cust_u.get("user_name") or "Valued Customer"
-                    deliv_address = cust_u.get("delivery_address") or "Your registered delivery address"
+                    frontend_base = (os.getenv("FRONTEND_URL") or "https://front-end-2-0-psi.vercel.app").rstrip("/")
+                    track_url = f"{frontend_base}/orders/{deliv['order_id']}/track"
                     email_html = f"""
                     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; color: #1e293b;">
                         <div style="text-align: center; margin-bottom: 24px;">
                             <span style="font-size: 26px; font-weight: 800; color: #16a34a; letter-spacing: -0.5px;">🚂 KandyPack Logistics</span>
-                            <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b; font-weight: 500;">Rail & Road Supply Chain Network</p>
+                            <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b; font-weight: 500;">Rail & Road Multimodal Logistics Network</p>
                         </div>
 
                         <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 20px; margin-bottom: 24px; text-align: center;">
                             <span style="font-size: 32px; display: block; margin-bottom: 8px;">📦✨</span>
-                            <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 20px; font-weight: 700;">Consignment Delivered!</h2>
-                            <p style="color: #166534; margin: 0; font-size: 14px;">Order <strong>#{deliv['order_id']}</strong> was marked as successfully delivered by the driver.</p>
+                            <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 20px; font-weight: 700;">Consignment Successfully Delivered!</h2>
+                            <p style="color: #166534; margin: 0; font-size: 14px;">Order <strong>#{deliv['order_id']}</strong> was safely delivered to your doorstep.</p>
                         </div>
 
                         <p style="font-size: 15px; line-height: 1.6; color: #334155;">
                             Dear <strong>{recipient_disp_name}</strong>,<br><br>
-                            Thank you for choosing <strong>KandyPack</strong>! We are pleased to confirm that your shipment has completed its journey from our central depot and has been delivered to your doorstep.
+                            Thank you for choosing <strong>KandyPack</strong>! We are delighted to confirm that your shipment has completed its journey from our central goods shed depot and has been delivered to your location.
                         </p>
 
                         <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; margin: 20px 0;">
-                            <h4 style="margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px;">Delivery Summary</h4>
+                            <h4 style="margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px;">Delivery Details</h4>
                             <table style="width: 100%; font-size: 14px; border-collapse: collapse;">
                                 <tr>
                                     <td style="padding: 6px 0; color: #64748b; width: 38%;">Order Number:</td>
@@ -451,42 +479,53 @@ def complete_driver_delivery(
                                     <td style="padding: 6px 0; font-weight: 500; color: #0f172a;">{deliv_address}</td>
                                 </tr>
                                 <tr>
-                                    <td style="padding: 6px 0; color: #64748b;">Delivery Time:</td>
+                                    <td style="padding: 6px 0; color: #64748b;">Delivered At:</td>
                                     <td style="padding: 6px 0; color: #0f172a;">{now.strftime('%d/%m/%Y at %I:%M %p')}</td>
                                 </tr>
                                 <tr>
-                                    <td style="padding: 6px 0; color: #64748b;">Driver Handover Note:</td>
+                                    <td style="padding: 6px 0; color: #64748b;">Driver Proof Note:</td>
                                     <td style="padding: 6px 0; font-style: italic; color: #0f172a;">"{proof_text}"</td>
                                 </tr>
                             </table>
                         </div>
 
                         <p style="font-size: 14px; line-height: 1.6; color: #475569;">
-                            Please inspect your delivered items. Once you're satisfied, sign in to your KandyPack account to confirm receipt and close your shipment.
+                            Please inspect your delivered items. When you are ready, sign in to confirm receipt and rate your experience:
                         </p>
 
                         <div style="text-align: center; margin: 28px 0 20px 0;">
-                            <a href="http://localhost:3000/orders/{deliv['order_id']}/track" style="background: #16a34a; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 10px; font-weight: 600; font-size: 14px; display: inline-block; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.25);">View Shipment & Confirm Receipt</a>
+                            <a href="{track_url}" style="background: #16a34a; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 10px; font-weight: 600; font-size: 14px; display: inline-block; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.25);">View Shipment & Confirm Receipt</a>
                         </div>
 
                         <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0 16px 0;" />
                         <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">
-                            Thank you for your trust in KandyPack Logistics. If you have any questions, reply to this email or reach out to your local depot.
+                            Thank you for your trust in KandyPack Logistics. We appreciate your business!
                         </p>
                     </div>
                     """
                     try:
-                        log_and_dispatch_email(
-                            to_email=cust_u["email"],
-                            subject=f"[KandyPack] Order #{deliv['order_id']} Delivered — Thank you for choosing us!",
+                        email_dispatched = log_and_dispatch_email(
+                            to_email=target_email,
+                            subject=f"[KandyPack] Order #{deliv['order_id']} Delivered — Thank you for choosing KandyPack!",
                             html_content=email_html,
                             notification_type="DELIVERY_CONFIRMATION"
                         )
+                        logger.info(f"Dispatched thank-you email to customer {target_email} for order #{deliv['order_id']}: {email_dispatched}")
                     except Exception as mail_err:
-                        logger.warning("Could not dispatch customer delivery email: %s", mail_err)
+                        logger.error(f"Error dispatching thank-you email to {target_email}: {mail_err}")
 
                 conn.commit()
-                return {"status": "SUCCESS", "message": f"Delivery #{delivery_id} marked as DELIVERED.", "order_id": deliv["order_id"]}
+                return {
+                    "status": "SUCCESS",
+                    "message": f"Delivery #{delivery_id} marked as DELIVERED.",
+                    "order_id": deliv["order_id"],
+                    "customer_email": target_email or None,
+                    "customer_name": recipient_disp_name,
+                    "delivery_address": deliv_address,
+                    "proof_reference": proof_text,
+                    "delivered_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "email_dispatched": email_dispatched
+                }
     except HTTPException:
         raise
     except Exception as exc:

@@ -365,124 +365,136 @@ def complete_driver_delivery(
 ):
     """Complete a specific delivery run stop and update the related customer order."""
     from app.core.database import get_db
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT d.delivery_id, d.order_id, d.roster_id, d.delivery_status, co.customer_id
-                FROM delivery d
-                JOIN customer_order co ON co.order_id = d.order_id
-                WHERE d.delivery_id = %s
-            """, (delivery_id,))
-            deliv = cursor.fetchone()
-            if not deliv:
-                raise HTTPException(status_code=404, detail="Delivery record not found.")
-
-            now = datetime.now()
-            cursor.execute("""
-                UPDATE delivery 
-                SET delivery_status = 'DELIVERED', delivered_at = %s, proof_reference = %s
-                WHERE delivery_id = %s
-            """, (now, payload.proof_reference or "Handed over to recipient, signed.", delivery_id))
-
-            cursor.execute("UPDATE customer_order SET status = 'DELIVERED' WHERE order_id = %s", (deliv["order_id"],))
-            cursor.execute("""
-                INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
-                VALUES ('DELIVERED', %s, %s, %s)
-            """, (deliv["order_id"], current_user["user_id"], now))
-
-            # Send notification & thank-you email
-            cursor.execute("""
-                SELECT 
-                    u.email, u.user_id, u.name AS user_name,
-                    c.customer_name,
-                    co.recipient_name, co.recipient_phone, co.delivery_address, co.total_amount
-                FROM customer c 
-                JOIN `user` u ON u.user_id = c.user_id 
-                JOIN customer_order co ON co.customer_id = c.customer_id
-                WHERE c.customer_id = %s AND co.order_id = %s
-            """, (deliv["customer_id"], deliv["order_id"]))
-            cust_u = cursor.fetchone()
-            if cust_u:
-                proof_text = payload.proof_reference or "Handed over to recipient, signed."
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
-                    VALUES (%s, %s, 'DELIVERY_UPDATE', 'Consignment Delivered to Doorstep', %s, %s, 0, %s)
-                """, (
-                    cust_u["user_id"], cust_u["email"],
-                    f"Your order #{deliv['order_id']} has been delivered to {cust_u.get('delivery_address', 'your doorstep')}. Proof: {proof_text}. Please inspect and confirm receipt.",
-                    deliv["order_id"], now
-                ))
+                    SELECT d.delivery_id, d.order_id, d.roster_id, d.delivery_status, co.customer_id
+                    FROM delivery d
+                    JOIN customer_order co ON co.order_id = d.order_id
+                    WHERE d.delivery_id = %s
+                """, (delivery_id,))
+                deliv = cursor.fetchone()
+                if not deliv:
+                    raise HTTPException(status_code=404, detail="Delivery record not found.")
 
-                # Dispatch customer thank-you email via notification service
-                from app.core.notifications import log_and_dispatch_email
-                recipient_disp_name = cust_u.get("recipient_name") or cust_u.get("customer_name") or cust_u.get("user_name") or "Valued Customer"
-                deliv_address = cust_u.get("delivery_address") or "Your registered delivery address"
-                email_html = f"""
-                <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; color: #1e293b;">
-                    <div style="text-align: center; margin-bottom: 24px;">
-                        <span style="font-size: 26px; font-weight: 800; color: #16a34a; letter-spacing: -0.5px;">🚂 KandyPack Logistics</span>
-                        <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b; font-weight: 500;">Rail & Road Supply Chain Network</p>
+                now = datetime.now()
+                cursor.execute("""
+                    UPDATE delivery 
+                    SET delivery_status = 'DELIVERED', delivered_at = %s, proof_reference = %s
+                    WHERE delivery_id = %s
+                """, (now, payload.proof_reference or "Handed over to recipient, signed.", delivery_id))
+
+                cursor.execute("UPDATE customer_order SET status = 'DELIVERED' WHERE order_id = %s", (deliv["order_id"],))
+                cursor.execute("""
+                    INSERT INTO order_status_history (status, order_id, changed_by, changed_at)
+                    VALUES ('DELIVERED', %s, %s, %s)
+                """, (deliv["order_id"], current_user.get("user_id"), now))
+
+                # Send notification & thank-you email
+                cursor.execute("""
+                    SELECT 
+                        u.email, u.user_id, u.name AS user_name,
+                        c.customer_name,
+                        co.recipient_name, co.recipient_phone, co.delivery_address
+                    FROM customer c 
+                    JOIN `user` u ON u.user_id = c.user_id 
+                    JOIN customer_order co ON co.customer_id = c.customer_id
+                    WHERE c.customer_id = %s AND co.order_id = %s
+                """, (deliv["customer_id"], deliv["order_id"]))
+                cust_u = cursor.fetchone()
+                if cust_u:
+                    proof_text = payload.proof_reference or "Handed over to recipient, signed."
+                    try:
+                        cursor.execute("""
+                            INSERT INTO notification (user_id, recipient_email, notification_type, title, message, order_id, is_read, created_at)
+                            VALUES (%s, %s, 'DELIVERY_UPDATE', 'Consignment Delivered to Doorstep', %s, %s, 0, %s)
+                        """, (
+                            cust_u["user_id"], cust_u["email"],
+                            f"Your order #{deliv['order_id']} has been delivered to {cust_u.get('delivery_address', 'your doorstep')}. Proof: {proof_text}. Please inspect and confirm receipt.",
+                            deliv["order_id"], now
+                        ))
+                    except Exception as notif_err:
+                        logger.warning("Could not record database notification: %s", notif_err)
+
+                    # Dispatch customer thank-you email via notification service
+                    from app.core.notifications import log_and_dispatch_email
+                    recipient_disp_name = cust_u.get("recipient_name") or cust_u.get("customer_name") or cust_u.get("user_name") or "Valued Customer"
+                    deliv_address = cust_u.get("delivery_address") or "Your registered delivery address"
+                    email_html = f"""
+                    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; color: #1e293b;">
+                        <div style="text-align: center; margin-bottom: 24px;">
+                            <span style="font-size: 26px; font-weight: 800; color: #16a34a; letter-spacing: -0.5px;">🚂 KandyPack Logistics</span>
+                            <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b; font-weight: 500;">Rail & Road Supply Chain Network</p>
+                        </div>
+
+                        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 20px; margin-bottom: 24px; text-align: center;">
+                            <span style="font-size: 32px; display: block; margin-bottom: 8px;">📦✨</span>
+                            <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 20px; font-weight: 700;">Consignment Delivered!</h2>
+                            <p style="color: #166534; margin: 0; font-size: 14px;">Order <strong>#{deliv['order_id']}</strong> was marked as successfully delivered by the driver.</p>
+                        </div>
+
+                        <p style="font-size: 15px; line-height: 1.6; color: #334155;">
+                            Dear <strong>{recipient_disp_name}</strong>,<br><br>
+                            Thank you for choosing <strong>KandyPack</strong>! We are pleased to confirm that your shipment has completed its journey from our central depot and has been delivered to your doorstep.
+                        </p>
+
+                        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; margin: 20px 0;">
+                            <h4 style="margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px;">Delivery Summary</h4>
+                            <table style="width: 100%; font-size: 14px; border-collapse: collapse;">
+                                <tr>
+                                    <td style="padding: 6px 0; color: #64748b; width: 38%;">Order Number:</td>
+                                    <td style="padding: 6px 0; font-weight: 600; color: #0f172a;">#{deliv['order_id']}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px 0; color: #64748b;">Delivered To:</td>
+                                    <td style="padding: 6px 0; font-weight: 500; color: #0f172a;">{deliv_address}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px 0; color: #64748b;">Delivery Time:</td>
+                                    <td style="padding: 6px 0; color: #0f172a;">{now.strftime('%d/%m/%Y at %I:%M %p')}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px 0; color: #64748b;">Driver Handover Note:</td>
+                                    <td style="padding: 6px 0; font-style: italic; color: #0f172a;">"{proof_text}"</td>
+                                </tr>
+                            </table>
+                        </div>
+
+                        <p style="font-size: 14px; line-height: 1.6; color: #475569;">
+                            Please inspect your delivered items. Once you're satisfied, sign in to your KandyPack account to confirm receipt and close your shipment.
+                        </p>
+
+                        <div style="text-align: center; margin: 28px 0 20px 0;">
+                            <a href="http://localhost:3000/orders/{deliv['order_id']}/track" style="background: #16a34a; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 10px; font-weight: 600; font-size: 14px; display: inline-block; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.25);">View Shipment & Confirm Receipt</a>
+                        </div>
+
+                        <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0 16px 0;" />
+                        <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">
+                            Thank you for your trust in KandyPack Logistics. If you have any questions, reply to this email or reach out to your local depot.
+                        </p>
                     </div>
+                    """
+                    try:
+                        log_and_dispatch_email(
+                            to_email=cust_u["email"],
+                            subject=f"[KandyPack] Order #{deliv['order_id']} Delivered — Thank you for choosing us!",
+                            html_content=email_html,
+                            notification_type="DELIVERY_CONFIRMATION"
+                        )
+                    except Exception as mail_err:
+                        logger.warning("Could not dispatch customer delivery email: %s", mail_err)
 
-                    <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 20px; margin-bottom: 24px; text-align: center;">
-                        <span style="font-size: 32px; display: block; margin-bottom: 8px;">📦✨</span>
-                        <h2 style="color: #15803d; margin: 0 0 6px 0; font-size: 20px; font-weight: 700;">Consignment Delivered!</h2>
-                        <p style="color: #166534; margin: 0; font-size: 14px;">Order <strong>#{deliv['order_id']}</strong> was marked as successfully delivered by the driver.</p>
-                    </div>
-
-                    <p style="font-size: 15px; line-height: 1.6; color: #334155;">
-                        Dear <strong>{recipient_disp_name}</strong>,<br><br>
-                        Thank you for choosing <strong>KandyPack</strong>! We are pleased to confirm that your shipment has completed its journey from our central depot and has been delivered to your doorstep.
-                    </p>
-
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; margin: 20px 0;">
-                        <h4 style="margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px;">Delivery Summary</h4>
-                        <table style="width: 100%; font-size: 14px; border-collapse: collapse;">
-                            <tr>
-                                <td style="padding: 6px 0; color: #64748b; width: 38%;">Order Number:</td>
-                                <td style="padding: 6px 0; font-weight: 600; color: #0f172a;">#{deliv['order_id']}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 6px 0; color: #64748b;">Delivered To:</td>
-                                <td style="padding: 6px 0; font-weight: 500; color: #0f172a;">{deliv_address}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 6px 0; color: #64748b;">Delivery Time:</td>
-                                <td style="padding: 6px 0; color: #0f172a;">{now.strftime('%d/%m/%Y at %I:%M %p')}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 6px 0; color: #64748b;">Driver Handover Note:</td>
-                                <td style="padding: 6px 0; font-style: italic; color: #0f172a;">"{proof_text}"</td>
-                            </tr>
-                        </table>
-                    </div>
-
-                    <p style="font-size: 14px; line-height: 1.6; color: #475569;">
-                        Please inspect your delivered items. Once you're satisfied, sign in to your KandyPack account to confirm receipt and close your shipment.
-                    </p>
-
-                    <div style="text-align: center; margin: 28px 0 20px 0;">
-                        <a href="http://localhost:3000/orders/{deliv['order_id']}/track" style="background: #16a34a; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 10px; font-weight: 600; font-size: 14px; display: inline-block; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.25);">View Shipment & Confirm Receipt</a>
-                    </div>
-
-                    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0 16px 0;" />
-                    <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">
-                        Thank you for your trust in KandyPack Logistics. If you have any questions, reply to this email or reach out to your local depot.
-                    </p>
-                </div>
-                """
-                try:
-                    log_and_dispatch_email(
-                        to_email=cust_u["email"],
-                        subject=f"[KandyPack] Order #{deliv['order_id']} Delivered — Thank you for choosing us!",
-                        html_content=email_html,
-                        notification_type="DELIVERY_CONFIRMATION"
-                    )
-                except Exception as mail_err:
-                    logger.warning("Could not dispatch customer delivery email: %s", mail_err)
-
-            conn.commit()
-            return {"status": "SUCCESS", "message": f"Delivery #{delivery_id} marked as DELIVERED.", "order_id": deliv["order_id"]}
+                conn.commit()
+                return {"status": "SUCCESS", "message": f"Delivery #{delivery_id} marked as DELIVERED.", "order_id": deliv["order_id"]}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to complete delivery #%s: %s", delivery_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to complete delivery: {str(exc)}"
+        )
 
 
 @router.get("/train-trips")

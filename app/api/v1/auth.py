@@ -562,7 +562,7 @@ def forgot_password(payload: ForgotPasswordRequest):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT user_id, name, email, role, is_active FROM user WHERE email = %s AND is_active = 1",
+                "SELECT user_id, name, email, role, is_active FROM user WHERE LOWER(email) = %s AND is_active = 1",
                 (norm_email,)
             )
             user = cursor.fetchone()

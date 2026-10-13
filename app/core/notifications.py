@@ -101,7 +101,7 @@ def log_and_dispatch_email(
 
     delivered_live = False
 
-    # 1. Primary: SMTP dispatch (e.g. Gmail SMTP via App Password, directly sends from sachinigunasekara2004@gmail.com to target user)
+    # 1. Direct SMTP dispatch (Active when running locally or on unblocked infrastructure)
     smtp_host = (os.getenv("SMTP_HOST") or "").strip() or "smtp.gmail.com"
     smtp_user = (os.getenv("SMTP_USER") or "").strip() or "sachinigunasekara2004@gmail.com"
     smtp_pass = (os.getenv("SMTP_PASSWORD") or "").strip() or "jwlojstktcdpaehw"
@@ -110,7 +110,10 @@ def log_and_dispatch_email(
     except Exception:
         smtp_port = 587
 
-    if smtp_host and smtp_user and smtp_pass:
+    # Render free tier blocks outbound ports 25, 465, and 587. Detect Render to prioritize HTTPS relay.
+    is_render = bool(os.getenv("RENDER") or "onrender.com" in os.getenv("RENDER_EXTERNAL_URL", ""))
+
+    if not is_render and smtp_host and smtp_user and smtp_pass:
         try:
             from email.utils import formatdate, make_msgid
             msg = MIMEMultipart("alternative")
@@ -123,7 +126,7 @@ def log_and_dispatch_email(
             msg.attach(MIMEText(text_content, "plain"))
             msg.attach(MIMEText(final_html, "html"))
 
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=8) as server:
                 server.starttls()
                 server.login(smtp_user, smtp_pass)
                 server.sendmail(smtp_user, [target_email], msg.as_string())
@@ -131,7 +134,64 @@ def log_and_dispatch_email(
             delivered_live = True
             logger.info(f"[SMTP SUCCESS] Dispatched live email to {target_email} from {smtp_user}")
         except Exception as smtp_err:
-            logger.warning(f"[SMTP FAILED] {smtp_err}. Falling back to Resend.")
+            logger.warning(f"[SMTP DIRECT FAILED] {smtp_err}. Trying HTTPS relay...")
+
+    # 2. Vercel HTTPS Mail Relay (Dispatches via Gmail SMTP over HTTPS Port 443 — bypasses Render's port blocks!)
+    if not delivered_live:
+        relay_urls = [
+            os.getenv("EMAIL_RELAY_URL", "https://front-end-2-0-psi.vercel.app/api/relay-email").strip(),
+            "http://kandypack-web:3000/api/relay-email"
+        ]
+        for r_url in relay_urls:
+            if not r_url:
+                continue
+            try:
+                import json
+                import urllib.request
+                relay_payload = {
+                    "to": target_email,
+                    "subject": email_subject,
+                    "html": final_html,
+                    "text": text_content
+                }
+                req = urllib.request.Request(
+                    r_url,
+                    data=json.dumps(relay_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "KandyPack-Backend/2.0"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    if resp.status in (200, 201):
+                        delivered_live = True
+                        print(f"[HTTPS RELAY SUCCESS] Live email delivered to {target_email} via {r_url}")
+                        logger.info(f"[HTTPS RELAY SUCCESS] Dispatched live email to {target_email} via {r_url}")
+                        break
+            except Exception as relay_err:
+                logger.warning(f"[HTTPS RELAY FAILED] {r_url}: {relay_err}")
+
+    # 3. Direct SMTP Fallback (if not tried yet)
+    if not delivered_live and smtp_host and smtp_user and smtp_pass:
+        try:
+            from email.utils import formatdate, make_msgid
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = email_subject
+            msg["From"] = f"KandyPack Logistics <{smtp_user}>"
+            msg["To"] = target_email
+            msg["Reply-To"] = smtp_user
+            msg["Date"] = formatdate(localtime=True)
+            msg["Message-ID"] = make_msgid(domain="gmail.com")
+            msg.attach(MIMEText(text_content, "plain"))
+            msg.attach(MIMEText(final_html, "html"))
+
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=8) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, [target_email], msg.as_string())
+            print(f"[SMTP DISPATCH SUCCESS] Live email delivered from {smtp_user} to {target_email}")
+            delivered_live = True
+            logger.info(f"[SMTP SUCCESS] Dispatched live email to {target_email} from {smtp_user}")
+        except Exception as smtp_err:
+            logger.warning(f"[SMTP FALLBACK FAILED] {smtp_err}")
 
     # 2. Resend REST API (Runs if SMTP was not configured or failed)
     if not delivered_live:

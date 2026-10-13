@@ -130,27 +130,30 @@ def trigger_migrate():
     return {"migrated": success}
 
 
-@app.api_route("/api/v1/auth/purge-test-user", methods=["GET", "POST"])
+@app.api_route("/api/v1/auth/purge-test-user", methods=["GET", "POST", "DELETE"])
 def purge_test_user(email: str):
-    """Purges a customer account from MySQL to allow testing OTP verification & re-registration."""
+    """Purges any user account from the cloud MySQL database to allow clean resets and re-testing."""
     clean_email = email.strip().lower()
-    if clean_email.endswith("@kandypack.lk") or clean_email == "customer1@gmail.com":
+    if clean_email == "admin@kandypack.lk":
         return JSONResponse(
             status_code=400,
-            content={"error": "Internal staff and default seeded accounts cannot be purged."}
+            content={"error": "The primary SuperAdmin account ('admin@kandypack.lk') cannot be purged."}
         )
 
     from app.core.database import get_db
     from app.core.cache import reset_login_failures
+    from app.api.v1.auth import _OTP_CACHE, _RESET_OTP_CACHE
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-                cur.execute("SELECT user_id FROM user WHERE LOWER(email) = %s;", (clean_email,))
+                cur.execute("SELECT user_id, role, name FROM user WHERE LOWER(email) = %s;", (clean_email,))
                 u_row = cur.fetchone()
                 deleted = False
+                role = None
                 if u_row:
                     uid = u_row["user_id"]
+                    role = u_row.get("role")
                     cur.execute("SELECT customer_id FROM customer WHERE user_id = %s;", (uid,))
                     c_row = cur.fetchone()
                     if c_row:
@@ -159,17 +162,28 @@ def purge_test_user(email: str):
                         cur.execute("DELETE FROM customer_order WHERE customer_id = %s;", (cid,))
                     cur.execute("DELETE FROM customer WHERE user_id = %s;", (uid,))
                     cur.execute("DELETE FROM notification WHERE user_id = %s OR LOWER(recipient_email) = %s;", (uid, clean_email))
+                    try:
+                        cur.execute("DELETE FROM driver WHERE user_id = %s;", (uid,))
+                        cur.execute("DELETE FROM assistant WHERE user_id = %s;", (uid,))
+                    except Exception:
+                        pass
                     cur.execute("DELETE FROM user WHERE user_id = %s;", (uid,))
                     deleted = True
                 else:
                     cur.execute("DELETE FROM notification WHERE LOWER(recipient_email) = %s;", (clean_email,))
                 cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
                 conn.commit()
+
+        # Clear in-memory caches and rate limits
+        _OTP_CACHE.pop(clean_email, None)
+        _RESET_OTP_CACHE.pop(clean_email, None)
         reset_login_failures(clean_email)
+
         return {
             "status": "SUCCESS",
             "message": f"Account '{clean_email}' successfully purged from the database.",
             "user_found_and_deleted": deleted,
+            "role": role,
             "ready_for_test": True
         }
     except Exception as e:

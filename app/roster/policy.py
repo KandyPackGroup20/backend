@@ -231,7 +231,7 @@ class DemoV1RosterPolicy:
 
         chain: list[tuple[datetime, datetime, bool]] = []
         for entry in entries:
-            if chain and chain[-1][1] == entry[0]:
+            if chain and entry[0] - chain[-1][1] < timedelta(hours=8):
                 chain.append(entry)
             else:
                 chain = [entry]

@@ -26,7 +26,7 @@ class PhaseTwoRail(identity.PhaseOneMySQL):
         root = Path(__file__).resolve().parents[2] / 'database'
         files = ['02_views.sql'] + ['feature_4_2_rail_allocation/' + name for name in (
             '01_trip_constraints.sql', '02_allocation_constraints.sql', '03_indexes.sql',
-            '04_fn_order_item_space.sql', '05_fn_trip_remaining_capacity.sql',
+            '04_fn_order_item_space.sql',
             '06_trg_capacity_check.sql', '07_trg_trip_capacity_shrink.sql',
             '08_sp_schedule_train_order.sql', '09_v_trip_capacity_usage.sql',
             '12_trg_allocation_quantity_guard.sql', '14_trg_rail_alloc_origin_bi.sql',

@@ -139,11 +139,7 @@ def reading():
 class CargoRepository:
     def stores(self, user=None):
         with reading() as cursor:
-            station_id = user.get("station_id") if user and user.get("role") == "DISPATCHER" else None
-            if station_id:
-                cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 AND station_id=%s ORDER BY city, station_id", (station_id,))
-            else:
-                cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 ORDER BY city, station_id")
+            cursor.execute("SELECT station_id, city AS station_name, address FROM station_store WHERE is_active=1 ORDER BY city, station_id")
             return {"stores": cursor.fetchall(), "timezone": "Asia/Colombo"}
 
     def _orders(self, cursor, where, params):

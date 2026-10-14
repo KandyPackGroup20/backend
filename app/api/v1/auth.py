@@ -940,11 +940,25 @@ def update_current_user_profile(
     
 # 7. Logout Endpoint
     
-@router.post("/logout")
+@router.api_route("/logout", methods=["GET", "POST"])
 def logout(response: Response):
-    response.delete_cookie(
-        key="kandypack_session",
-        httponly=True,
-        samesite="lax"
-    )
+    for sec in [True, False]:
+        for p in ["/", "/api", "/api/v1"]:
+            response.delete_cookie(
+                key="kandypack_session",
+                path=p,
+                httponly=True,
+                samesite="lax",
+                secure=sec
+            )
+            response.set_cookie(
+                key="kandypack_session",
+                value="",
+                max_age=0,
+                expires=0,
+                path=p,
+                httponly=True,
+                samesite="lax",
+                secure=sec
+            )
     return {"message": "Logged out successfully"}

@@ -11,6 +11,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional, List, Dict
 from datetime import datetime
+import threading
 
 logger = logging.getLogger("kandypack.notifications")
 
@@ -87,22 +88,43 @@ def log_and_dispatch_email(
         </div>
         """
 
-    # Record in live in-memory dispatch log for UI polling / Web Push
+    # Record in live in-memory dispatch log for UI polling / Web Push immediately
     entry = {
         "id": len(_NOTIFICATION_DISPATCH_LOG) + 1,
         "type": notification_type,
         "recipient": target_email,
         "subject": email_subject,
-        "status": "DELIVERED",
+        "status": "SENT",
         "timestamp": timestamp,
         "body_preview": text_content[:120].strip() + "..."
     }
     _NOTIFICATION_DISPATCH_LOG.insert(0, entry)
 
+    # Spawn daemon thread to deliver email asynchronously without stalling the calling HTTP request
+    t = threading.Thread(
+        target=_perform_live_dispatch,
+        args=(target_email, email_subject, final_html, text_content, entry, notification_type),
+        daemon=True,
+        name=f"EmailDispatch-{entry['id']}"
+    )
+    t.start()
+
+    logger.info(f"[NOTIFICATION QUEUED ASYNC] Type={notification_type} To={target_email} Subject={email_subject}")
+    return True
+
+
+def _perform_live_dispatch(
+    target_email: str,
+    email_subject: str,
+    final_html: str,
+    text_content: str,
+    entry: dict,
+    notification_type: str
+):
+    """Executes live network email dispatch across HTTPS relay, direct SMTP, and Resend in a non-blocking background thread."""
     delivered_live = False
 
-    # 1. Direct SMTP dispatch (Active when running locally or on unblocked infrastructure)
-    # 1. Vercel HTTPS Mail Relay (Dispatches via Gmail SMTP over HTTPS Port 443 — 100% bypasses Render firewall & port blocks!)
+    # 1. Vercel / Next.js HTTPS Mail Relay (Dispatches via Gmail SMTP over HTTPS Port 443)
     relay_urls = [
         os.getenv("EMAIL_RELAY_URL", "https://front-end-2-0-psi.vercel.app/api/relay-email").strip(),
         "http://kandypack-web:3000/api/relay-email"
@@ -125,9 +147,10 @@ def log_and_dispatch_email(
                 headers={"Content-Type": "application/json", "User-Agent": "KandyPack-Backend/2.0"},
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 if resp.status in (200, 201):
                     delivered_live = True
+                    entry["status"] = "DELIVERED"
                     print(f"[HTTPS RELAY SUCCESS] Live email delivered to {target_email} via {r_url}")
                     logger.info(f"[HTTPS RELAY SUCCESS] Dispatched live email to {target_email} via {r_url}")
                     break
@@ -156,17 +179,18 @@ def log_and_dispatch_email(
             msg.attach(MIMEText(text_content, "plain"))
             msg.attach(MIMEText(final_html, "html"))
 
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=6) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=4) as server:
                 server.starttls()
                 server.login(smtp_user, smtp_pass)
                 server.sendmail(smtp_user, [target_email], msg.as_string())
             print(f"[SMTP DISPATCH SUCCESS] Live email delivered from {smtp_user} to {target_email}")
             delivered_live = True
+            entry["status"] = "DELIVERED"
             logger.info(f"[SMTP SUCCESS] Dispatched live email to {target_email} from {smtp_user}")
         except Exception as smtp_err:
             logger.warning(f"[SMTP FALLBACK FAILED] {smtp_err}")
 
-    # 2. Resend REST API (Runs if SMTP was not configured or failed)
+    # 3. Resend REST API (Runs if SMTP was not configured or failed)
     if not delivered_live:
         resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
         from_email = os.getenv("RESEND_FROM_EMAIL", "KandyPack Logistics <onboarding@resend.dev>").strip()
@@ -192,7 +216,7 @@ def log_and_dispatch_email(
                         "https://api.resend.com/emails",
                         json=payload,
                         headers=headers,
-                        timeout=10.0
+                        timeout=4.0
                     )
                     if resp.status_code in (200, 201):
                         return resp.json().get("id")
@@ -209,19 +233,19 @@ def log_and_dispatch_email(
                         headers=headers,
                         method="POST"
                     )
-                    with urllib.request.urlopen(req, timeout=10) as r:
+                    with urllib.request.urlopen(req, timeout=4) as r:
                         res_json = json.loads(r.read().decode("utf-8"))
                         return res_json.get("id")
 
             try:
                 msg_id = _post_resend(target_email)
                 delivered_live = True
+                entry["status"] = "DELIVERED"
                 logger.info(f"[RESEND SUCCESS] Live email delivered to {target_email} (ID: {msg_id})")
             except Exception as resend_err:
                 logger.warning(f"[EMAIL DISPATCH FAILED] Could not send email to {target_email}: {resend_err}")
 
-    logger.info(f"[NOTIFICATION RECORDED] Type={notification_type} To={target_email} Subject={email_subject}")
-    return True
+    logger.info(f"[NOTIFICATION RECORDED] Type={notification_type} To={target_email} Status={entry['status']}")
 
 def ensure_notification_table() -> bool:
     """Idempotently creates the notification table if it does not exist, and seeds historic alerts if empty."""

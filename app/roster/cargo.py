@@ -263,6 +263,20 @@ class CargoRepository:
                             cursor.execute("UPDATE customer_order SET status = 'OUT_FOR_DELIVERY' WHERE order_id = %s", (order["order_id"],))
                             cursor.execute("INSERT INTO order_status_history (status, order_id, changed_by, changed_at) VALUES ('OUT_FOR_DELIVERY', %s, %s, %s)",
                                            (order["order_id"], actor_id, now))
+
+                            # Inventory is atomically deducted by trg_deduct_inventory_on_delivery; record stock_adjustment audit log
+                            cursor.execute("SELECT product_id, quantity FROM order_item WHERE order_id = %s", (order["order_id"],))
+                            order_items = cursor.fetchall()
+                            for oi in order_items:
+                                p_id = oi["product_id"]
+                                qty = oi["quantity"]
+                                try:
+                                    cursor.execute("""
+                                        INSERT INTO stock_adjustment (station_id, product_id, quantity_adjusted, reason, reported_by, adjusted_by)
+                                        VALUES (%s, %s, %s, %s, %s, %s)
+                                    """, (station_id, p_id, -qty, f"Cargo dispatch: Order #{order['order_id']} on Roster #{roster_id}", actor_id, actor_id))
+                                except Exception:
+                                    pass
                     result = {"status": "SUCCESS", "result_code": "ORDERS_ASSIGNED" if new_orders else "ORDERS_ALREADY_ASSIGNED",
                               "roster_id": roster_id, "order_ids": ids, "cargo_weight_kg": money(total), "timezone": "Asia/Colombo"}
                     conn.commit()

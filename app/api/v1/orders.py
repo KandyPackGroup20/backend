@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 import datetime
 import re
@@ -82,6 +82,19 @@ class CreateOrderRequest(BaseModel):
     slot: Optional[str] = "06:30 AM Express Rail 101"
     items: Optional[List[OrderCartItem]] = None
     delivery_route_id: Optional[int] = None
+
+    @field_validator("booking_date")
+    @classmethod
+    def validate_booking_date(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            try:
+                b_date = datetime.date.fromisoformat(v)
+            except Exception:
+                raise ValueError("Invalid booking date format. Use YYYY-MM-DD.")
+            today = datetime.date.today()
+            if (b_date - today).days < 7:
+                raise ValueError("BUSINESS RULE VIOLATION: Orders must be placed at least 7 days in advance of the delivery date.")
+        return v
 
 class MilestoneSchema(BaseModel):
     title: str
@@ -644,15 +657,63 @@ def get_order_tracking(tracking_id: str,
 def mark_order_delivered(
     order_id: int,
     payload: DeliverOrderRequest = DeliverOrderRequest(),
-    current_user: dict = Depends(require_roles(["DRIVER", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
+    current_user: dict = Depends(require_roles(["DRIVER", "ASSISTANT", "SUPERADMIN", "DISPATCHER", "LOGISTICS_MGR"]))
 ):
     """Driver marks order as delivered to customer doorstep."""
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT order_id, customer_id, status FROM customer_order WHERE order_id = %s", (order_id,))
+            # Lock order row to prevent concurrent status modification
+            cursor.execute("SELECT order_id, customer_id, status FROM customer_order WHERE order_id = %s FOR UPDATE", (order_id,))
             order = cursor.fetchone()
             if not order:
                 raise HTTPException(status_code=404, detail="Order not found")
+
+            # Reject already completed or cancelled orders
+            if order["status"] in ("DELIVERED", "COMPLETED"):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error_code": "ALREADY_COMPLETED", "message": f"Order #{order_id} has already been marked as DELIVERED."}
+                )
+            if order["status"] == "CANCELLED":
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error_code": "ORDER_CANCELLED", "message": f"Order #{order_id} has been cancelled and cannot be delivered."}
+                )
+
+            # Check delivery record and verify driver/assistant roster assignment
+            cursor.execute("""
+                SELECT d.delivery_id, d.delivery_status, d.roster_id,
+                       r.driver_id, r.assistant_id,
+                       u_driver.user_id AS driver_user_id,
+                       u_asst.user_id AS asst_user_id
+                FROM delivery d
+                LEFT JOIN roster_assignment r ON d.roster_id = r.roster_id
+                LEFT JOIN delivery_staff ds_driver ON r.driver_id = ds_driver.delivery_staff_id
+                LEFT JOIN `user` u_driver ON ds_driver.user_id = u_driver.user_id
+                LEFT JOIN delivery_staff ds_asst ON r.assistant_id = ds_asst.delivery_staff_id
+                LEFT JOIN `user` u_asst ON ds_asst.user_id = u_asst.user_id
+                WHERE d.order_id = %s
+                LIMIT 1
+            """, (order_id,))
+            deliv = cursor.fetchone()
+            if deliv:
+                if deliv["delivery_status"] in ("DELIVERED", "COMPLETED"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "DELIVERY_ALREADY_COMPLETED", "message": f"Delivery for order #{order_id} is already completed."}
+                    )
+                if deliv["delivery_status"] == "CANCELLED":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "DELIVERY_CANCELLED", "message": f"Delivery for order #{order_id} has been cancelled."}
+                    )
+                if current_user["role"] in ("DRIVER", "ASSISTANT"):
+                    assigned_uids = [uid for uid in (deliv["driver_user_id"], deliv["asst_user_id"]) if uid is not None]
+                    if current_user["user_id"] not in assigned_uids:
+                        raise HTTPException(
+                            status_code=403,
+                            detail={"error_code": "UNAUTHORIZED_STAFF", "message": "FORBIDDEN: You are not assigned to this delivery's roster run."}
+                        )
 
             now = datetime.datetime.now()
             cursor.execute("UPDATE customer_order SET status = 'DELIVERED' WHERE order_id = %s", (order_id,))
@@ -693,7 +754,8 @@ def confirm_order_received(
     """Customer verifies and confirms order was received."""
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT order_id, customer_id, status FROM customer_order WHERE order_id = %s", (order_id,))
+            # Lock order row to prevent concurrent receipt confirmation
+            cursor.execute("SELECT order_id, customer_id, status FROM customer_order WHERE order_id = %s FOR UPDATE", (order_id,))
             order = cursor.fetchone()
             if not order:
                 raise HTTPException(status_code=404, detail="Order not found")
@@ -748,11 +810,12 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
 
     with get_db() as conn:
         with conn.cursor() as cursor:
-            # 1. Fetch or initialize customer record
+            # 1. Fetch or initialize customer record with explicit row lock to serialize concurrent checkouts from same account
             cursor.execute("""
                 SELECT customer_id, customer_name, phone, address_line, route_id, city
                 FROM customer
                 WHERE user_id=%s
+                FOR UPDATE
             """, (current_user["user_id"],))
             cust_row = cursor.fetchone()
             if not cust_row:
@@ -846,7 +909,15 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                 try:
                     delivery_date = datetime.date.fromisoformat(payload.booking_date)
                 except Exception:
-                    delivery_date = order_date + datetime.timedelta(days=7)
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error_code": "INVALID_DATE_FORMAT", "message": "Invalid booking date format. Use YYYY-MM-DD."}
+                    )
+                if (delivery_date - order_date).days < 7:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error_code": "ADVANCE_NOTICE_REQUIRED", "message": "Orders must be placed at least 7 days in advance of the delivery date."}
+                    )
             else:
                 delivery_date = order_date + datetime.timedelta(days=7)
 
@@ -860,8 +931,13 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                     (customer_id, order_date, delivery_date, chosen_route_id, delivery_addr, customer_display_name, customer_phone)
                 )
             except Exception as e:
-                # If column missing in unmigrated database instance, self-heal or fallback
                 err_str = str(e)
+                if "7 days in advance" in err_str or "ADVANCE_NOTICE" in err_str or "45000" in err_str or "1644" in err_str:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error_code": "ADVANCE_NOTICE_REQUIRED", "message": "BUSINESS RULE VIOLATION: Orders must be placed at least 7 days in advance of the delivery date."}
+                    )
+                # If column missing in unmigrated database instance, self-heal or fallback
                 if "1054" in err_str or "Unknown column" in err_str:
                     logger.warning(f"customer_order missing routing columns. Attempting dynamic auto-migration: {e}")
                     for col, defn in [
@@ -904,9 +980,20 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
             item_summaries = []
 
             if payload.items and len(payload.items) > 0:
-                # Load all products from DB for accurate calculations
+                # Load products with explicit row-level locking (SELECT ... FOR UPDATE) in ascending ID order to prevent deadlocks
+                sorted_product_ids = sorted(list({int(it.product_id) for it in payload.items}))
+                placeholders = ','.join(['%s'] * len(sorted_product_ids))
                 try:
-                    cursor.execute("SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate FROM product")
+                    cursor.execute(
+                        f"""
+                        SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate 
+                        FROM product 
+                        WHERE product_id IN ({placeholders})
+                        ORDER BY product_id ASC
+                        FOR UPDATE
+                        """,
+                        tuple(sorted_product_ids)
+                    )
                     prod_map = {p["product_id"]: p for p in cursor.fetchall()}
                 except Exception as e:
                     if "1054" in str(e) or "Unknown column" in str(e):
@@ -921,10 +1008,28 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                             except Exception:
                                 pass
                         try:
-                            cursor.execute("SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate FROM product")
+                            cursor.execute(
+                                f"""
+                                SELECT product_id, product_name, category, unit_price, unit_weight_kg, space_consumption_rate 
+                                FROM product 
+                                WHERE product_id IN ({placeholders})
+                                ORDER BY product_id ASC
+                                FOR UPDATE
+                                """,
+                                tuple(sorted_product_ids)
+                            )
                             prod_map = {p["product_id"]: p for p in cursor.fetchall()}
                         except Exception:
-                            cursor.execute("SELECT product_id, product_name, unit_price, space_consumption_rate FROM product")
+                            cursor.execute(
+                                f"""
+                                SELECT product_id, product_name, unit_price, space_consumption_rate 
+                                FROM product 
+                                WHERE product_id IN ({placeholders})
+                                ORDER BY product_id ASC
+                                FOR UPDATE
+                                """,
+                                tuple(sorted_product_ids)
+                            )
                             raw_rows = cursor.fetchall()
                             prod_map = {}
                             for p in raw_rows:
@@ -965,13 +1070,13 @@ def create_consignment_order(payload: CreateOrderRequest, request: Request,
                         total_goods_amount += item_price
                         item_summaries.append(f"{prod['product_name']} (Qty: {item.quantity}, {item_weight:.1f}kg)")
             else:
-                # Single/legacy item fallback
+                # Single/legacy item fallback with explicit row locking
                 try:
-                    cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
+                    cursor.execute("SELECT product_id, product_name, unit_price, unit_weight_kg, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1 FOR UPDATE")
                     prod = cursor.fetchone()
                 except Exception:
                     try:
-                        cursor.execute("SELECT product_id, product_name, unit_price, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1")
+                        cursor.execute("SELECT product_id, product_name, unit_price, space_consumption_rate FROM product ORDER BY product_id ASC LIMIT 1 FOR UPDATE")
                         prod = cursor.fetchone()
                         if prod:
                             prod["unit_weight_kg"] = 25.0

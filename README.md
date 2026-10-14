@@ -209,15 +209,12 @@ Router: `app/api/v1/auth.py`
 | `POST` | `/api/v1/auth/login` | Public | Authenticates credentials with anti-brute-force rate limiting; verified users log in immediately without OTP. Fresh unverified customers receive a one-time OTP check. |
 | `POST` | `/api/v1/auth/verify-otp` | Public | Verifies the registration 6-digit OTP, marks `email_verified = 1`, and establishes the user session. |
 | `POST` | `/api/v1/auth/resend-otp` | Public | Generates and emails a fresh 6-digit verification code for unverified accounts. |
-| `GET` | `/api/v1/auth/latest-otp` | Public / Demo | Returns active registration/login OTP code from in-memory cache for demonstration and testing. |
 | `POST` | `/api/v1/auth/forgot-password` | Public | Dispatches a 6-digit password recovery code via Gmail SMTP to the user's registered email address. |
 | `POST` | `/api/v1/auth/reset-password` | Public | Verifies the 6-digit reset code and sets a new password (clearing login locks). |
-| `GET` | `/api/v1/auth/latest-reset-otp` | Public / Demo | Returns active password reset code from cache for testing. |
 | `GET` | `/api/v1/auth/me` | Authenticated | Resolves the profile, role, and station assignment of the active session. |
 | `POST` | `/api/v1/auth/change-password` | Authenticated | Updates account password and clears the `force_password_reset` flag. |
 | `POST` | `/api/v1/auth/users` | `SUPERADMIN` | Provisions internal staff (`STORE_MGR`, `WAREHOUSE_STAFF`, `DISPATCHER`, `DRIVER`, etc.). |
 | `POST` | `/api/v1/auth/logout` | Authenticated | Revokes the session by clearing the `kandypack_session` cookie. |
-| `DELETE` | `/api/v1/auth/test-purge-customer` | Public / Demo | Purges demo customer accounts to permit repeatable registration testing. |
 
 ---
 

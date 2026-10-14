@@ -231,24 +231,21 @@ def _login(payload: LoginRequest, response: Response, request: Request):
                             "force_password_reset": False,
                             "message": "A 6-digit verification code has been sent to your email to verify your new account. Please enter it to complete sign in.",
                             "require_otp": True,
-                            "otp_code": otp,
                         }
                     else:
                         # Step 2: Verify the provided OTP code
                         submitted_otp = payload.otp_code.strip()
                         cached = _OTP_CACHE.get(norm_email)
-                        is_test_bypass = submitted_otp in ("000000", "123456")
-                        if not is_test_bypass:
-                            if not cached or time.time() > cached.get("expires_at", 0):
-                                raise HTTPException(
-                                    status_code=status.HTTP_400_BAD_REQUEST,
-                                    detail="INVALID_OTP: Verification code expired or not found. Please request a new code."
-                                )
-                            if cached.get("code") != submitted_otp:
-                                raise HTTPException(
-                                    status_code=status.HTTP_400_BAD_REQUEST,
-                                    detail="INVALID_OTP: Incorrect verification code. Please check your email and try again."
-                                )
+                        if not cached or time.time() > cached.get("expires_at", 0):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="INVALID_OTP: Verification code expired or not found. Please request a new code."
+                            )
+                        if cached.get("code") != submitted_otp:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="INVALID_OTP: Incorrect verification code. Please check your email and try again."
+                            )
                         _OTP_CACHE.pop(norm_email, None)
                         # Mark email as verified in DB so subsequent logins NEVER require OTP!
                         cursor.execute("UPDATE user SET email_verified = 1 WHERE user_id = %s", (user["user_id"],))
@@ -360,8 +357,7 @@ def resend_otp(payload: ResendOtpRequest):
                 logger.warning("Could not resend OTP: %s", mail_err)
 
             return {
-                "message": "A new verification code has been sent to your email.",
-                "otp_code": otp
+                "message": "A new verification code has been sent to your email."
             }
 
 
@@ -458,7 +454,6 @@ def register_customer(payload: CustomerRegisterRequest, response: Response, requ
                     "email": payload.email,
                     "role": "CUSTOMER",
                     "require_otp": True,
-                    "otp_code": otp,
                     "message": "Registration successful! A 6-digit verification code has been dispatched to your email."
                 }
     except HTTPException:
@@ -492,18 +487,16 @@ def verify_registration_otp(payload: VerifyOtpRequest, response: Response, reque
     norm_email = payload.email.lower().strip()
     submitted_otp = payload.otp_code.strip()
     cached = _OTP_CACHE.get(norm_email)
-    is_test_bypass = submitted_otp in ("000000", "123456")
-    if not is_test_bypass:
-        if not cached or time.time() > cached.get("expires_at", 0):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="INVALID_OTP: Verification code expired or not found. Please request a new code."
-            )
-        if cached.get("code") != submitted_otp:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="INVALID_OTP: Incorrect verification code. Please check your email and try again."
-            )
+    if not cached or time.time() > cached.get("expires_at", 0):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_OTP: Verification code expired or not found. Please request a new code."
+        )
+    if cached.get("code") != submitted_otp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_OTP: Incorrect verification code. Please check your email and try again."
+        )
     user_id = cached.get("user_id") if cached else None
     _OTP_CACHE.pop(norm_email, None)
 
@@ -543,9 +536,11 @@ def verify_registration_otp(payload: VerifyOtpRequest, response: Response, reque
     }
 
 
-@router.get("/latest-otp")
+@router.get("/latest-otp", include_in_schema=False, dependencies=[Depends(require_roles(["SUPERADMIN"]))])
 def get_latest_otp(email: str):
-    """Returns active verification code for testing and demonstration."""
+    """Returns active verification code for authenticated administrative testing only."""
+    if os.getenv("ALLOW_TEST_OTP_LOOKUP", "false").lower() != "true":
+        raise HTTPException(status_code=404, detail="Endpoint not found.")
     norm_email = email.lower().strip()
     cached = _OTP_CACHE.get(norm_email)
     if not cached:
@@ -619,8 +614,7 @@ def forgot_password(payload: ForgotPasswordRequest):
 
             return {
                 "message": "A 6-digit password reset code has been sent to your email address.",
-                "email": user["email"],
-                "reset_code": otp
+                "email": user["email"]
             }
 
 
@@ -630,19 +624,17 @@ def reset_password(payload: ResetPasswordRequest):
     norm_email = payload.email.lower().strip()
     submitted_otp = payload.otp_code.strip()
     cached = _RESET_OTP_CACHE.get(norm_email)
-    is_test_bypass = submitted_otp in ("000000", "123456")
 
-    if not is_test_bypass:
-        if not cached or time.time() > cached.get("expires_at", 0):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="INVALID_OTP: Password reset code expired or not found. Please request a new code."
-            )
-        if cached.get("code") != submitted_otp:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="INVALID_OTP: Incorrect password reset code. Please check your email and try again."
-            )
+    if not cached or time.time() > cached.get("expires_at", 0):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_OTP: Password reset code expired or not found. Please request a new code."
+        )
+    if cached.get("code") != submitted_otp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_OTP: Incorrect password reset code. Please check your email and try again."
+        )
 
     new_hash = get_password_hash(payload.new_password)
     with get_db() as conn:
@@ -669,9 +661,11 @@ def reset_password(payload: ResetPasswordRequest):
     }
 
 
-@router.get("/latest-reset-otp")
+@router.get("/latest-reset-otp", include_in_schema=False, dependencies=[Depends(require_roles(["SUPERADMIN"]))])
 def get_latest_reset_otp(email: str):
-    """Returns active password reset code for automated testing and verification."""
+    """Returns active password reset code for authenticated administrative testing only."""
+    if os.getenv("ALLOW_TEST_OTP_LOOKUP", "false").lower() != "true":
+        raise HTTPException(status_code=404, detail="Endpoint not found.")
     norm_email = email.lower().strip()
     cached = _RESET_OTP_CACHE.get(norm_email)
     if not cached:

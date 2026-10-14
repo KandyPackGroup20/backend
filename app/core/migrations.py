@@ -154,6 +154,86 @@ def run_migrations():
                     except Exception:
                         pass
 
+                    # Ensure 7-Day Advance Notice Triggers exist on deployed database
+                    try:
+                        cur.execute("SHOW TRIGGERS WHERE `Trigger` = 'trg_enforce_7_day_advance_order'")
+                        if not cur.fetchone():
+                            logger.info("Deploying trg_enforce_7_day_advance_order trigger to database...")
+                            cur.execute("""
+                                CREATE TRIGGER trg_enforce_7_day_advance_order
+                                BEFORE INSERT ON customer_order
+                                FOR EACH ROW
+                                BEGIN
+                                    IF NEW.delivery_date IS NOT NULL AND NEW.order_date IS NOT NULL THEN
+                                        IF DATEDIFF(NEW.delivery_date, NEW.order_date) < 7 THEN
+                                            SIGNAL SQLSTATE '45000'
+                                            SET MESSAGE_TEXT = 'BUSINESS RULE VIOLATION: Orders must be placed at least 7 days in advance.';
+                                        END IF;
+                                    END IF;
+                                END;
+                            """)
+                            logger.info("Successfully deployed trg_enforce_7_day_advance_order trigger.")
+                    except Exception as e:
+                        logger.warning(f"Could not deploy trg_enforce_7_day_advance_order: {e}")
+
+                    try:
+                        cur.execute("SHOW TRIGGERS WHERE `Trigger` = 'trg_enforce_7_day_advance_order_update'")
+                        if not cur.fetchone():
+                            cur.execute("""
+                                CREATE TRIGGER trg_enforce_7_day_advance_order_update
+                                BEFORE UPDATE ON customer_order
+                                FOR EACH ROW
+                                BEGIN
+                                    IF NEW.delivery_date IS NOT NULL AND NEW.order_date IS NOT NULL THEN
+                                        IF DATEDIFF(NEW.delivery_date, NEW.order_date) < 7 THEN
+                                            SIGNAL SQLSTATE '45000'
+                                            SET MESSAGE_TEXT = 'BUSINESS RULE VIOLATION: Orders must be placed at least 7 days in advance.';
+                                        END IF;
+                                    END IF;
+                                END;
+                            """)
+                    except Exception as e:
+                        logger.warning(f"Could not deploy trg_enforce_7_day_advance_order_update: {e}")
+
+                    # Ensure Stock Handling inventory deduction trigger exists on delivery assignment
+                    try:
+                        cur.execute("SHOW TRIGGERS WHERE `Trigger` = 'trg_deduct_inventory_on_delivery'")
+                        if not cur.fetchone():
+                            logger.info("Deploying trg_deduct_inventory_on_delivery trigger to database...")
+                            cur.execute("""
+                                CREATE TRIGGER trg_deduct_inventory_on_delivery
+                                AFTER INSERT ON delivery
+                                FOR EACH ROW
+                                BEGIN
+                                    DECLARE v_station_id INT;
+
+                                    SELECT dr.station_id INTO v_station_id
+                                    FROM roster_assignment ra
+                                    JOIN delivery_route dr ON dr.route_id = ra.route_id
+                                    WHERE ra.roster_id = NEW.roster_id
+                                    LIMIT 1;
+
+                                    IF v_station_id IS NULL THEN
+                                        SELECT dr.station_id INTO v_station_id
+                                        FROM customer_order co
+                                        JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                                        WHERE co.order_id = NEW.order_id
+                                        LIMIT 1;
+                                    END IF;
+
+                                    IF v_station_id IS NOT NULL THEN
+                                        UPDATE inventory inv
+                                        JOIN order_item oi ON oi.product_id = inv.product_id
+                                        SET inv.stored_quantity = GREATEST(0, inv.stored_quantity - oi.quantity)
+                                        WHERE oi.order_id = NEW.order_id AND inv.station_id = v_station_id;
+                                    END IF;
+                                END;
+                            """)
+                            logger.info("Successfully deployed trg_deduct_inventory_on_delivery trigger.")
+                    except Exception as e:
+                        logger.warning(f"Could not deploy trg_deduct_inventory_on_delivery: {e}")
+
+
                 # 2c. Ensure product table has category, unit_weight_kg, description, image_url, is_active
                 cur.execute("SHOW TABLES LIKE 'product'")
                 if cur.fetchone():
@@ -305,7 +385,7 @@ def run_migrations():
                         pass
                     logger.info("Added audit_log.roster_id.")
 
-                # 5b. Ensure all active stations have delivery routes
+                # 5b. Ensure all active stations have delivery routes (>= 10 routes required by Project 3 spec)
                 try:
                     routes_to_seed = [
                         (1, 'Colombo Central Commercial Route', '04:30:00'),
@@ -315,6 +395,10 @@ def run_migrations():
                         (4, 'Matara Southern Express Route', '04:30:00'),
                         (5, 'Jaffna Northern Peninsula Route', '05:00:00'),
                         (6, 'Trincomalee Eastern Port Route', '04:30:00'),
+                        (1, 'Colombo Suburbs & Kelaniya Route', '04:00:00'),
+                        (3, 'Galle Southern Inland Route', '05:30:00'),
+                        (7, 'Kandy Central Goods & Peradeniya Local Route', '03:30:00'),
+                        (2, 'Negombo Airport & Katunayake Logistics Route', '03:00:00'),
                     ]
                     for st_id, r_name, max_t in routes_to_seed:
                         cur.execute("SELECT route_id FROM delivery_route WHERE station_id = %s AND route_name = %s", (st_id, r_name))
@@ -322,6 +406,229 @@ def run_migrations():
                             cur.execute("INSERT INTO delivery_route (station_id, route_name, max_delivery_time) VALUES (%s, %s, %s)", (st_id, r_name, max_t))
                 except Exception as e:
                     logger.warning(f"Could not seed delivery routes: {e}")
+
+                # 5b-2. Ensure 7-day advance order placement triggers
+                try:
+                    cur.execute("""
+                        CREATE TRIGGER IF NOT EXISTS trg_enforce_7_day_advance_order
+                        BEFORE INSERT ON customer_order
+                        FOR EACH ROW
+                        BEGIN
+                            IF NEW.delivery_date IS NOT NULL AND NEW.order_date IS NOT NULL THEN
+                                IF DATEDIFF(NEW.delivery_date, NEW.order_date) < 7 THEN
+                                    SIGNAL SQLSTATE '45000'
+                                    SET MESSAGE_TEXT = 'BUSINESS RULE VIOLATION: Orders must be placed at least 7 days in advance.';
+                                END IF;
+                            END IF;
+                        END;
+                    """)
+                except Exception as trg_err:
+                    pass
+
+                # 5b-3. Ensure inventory validation, deduction, and restoration triggers
+                try:
+                    cur.execute("DROP TRIGGER IF EXISTS trg_check_inventory_before_delivery")
+                    cur.execute("""
+                        CREATE TRIGGER trg_check_inventory_before_delivery
+                        BEFORE INSERT ON delivery
+                        FOR EACH ROW
+                        BEGIN
+                            DECLARE v_station_id INT;
+                            DECLARE v_shortage_count INT DEFAULT 0;
+
+                            IF NEW.delivery_status <> 'CANCELLED' THEN
+                                SELECT dr.station_id INTO v_station_id
+                                FROM roster_assignment ra
+                                JOIN delivery_route dr ON dr.route_id = ra.route_id
+                                WHERE ra.roster_id = NEW.roster_id
+                                LIMIT 1;
+
+                                IF v_station_id IS NULL THEN
+                                    SELECT dr.station_id INTO v_station_id
+                                    FROM customer_order co
+                                    JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                                    WHERE co.order_id = NEW.order_id
+                                    LIMIT 1;
+                                END IF;
+
+                                IF v_station_id IS NULL THEN
+                                    SIGNAL SQLSTATE '45000'
+                                    SET MESSAGE_TEXT = 'INSUFFICIENT_STOCK: Destination station store could not be resolved for delivery order';
+                                END IF;
+
+                                SELECT COUNT(*) INTO v_shortage_count
+                                FROM (
+                                    SELECT oi.product_id, SUM(oi.quantity) AS required_qty
+                                    FROM order_item oi
+                                    WHERE oi.order_id = NEW.order_id
+                                    GROUP BY oi.product_id
+                                ) req
+                                LEFT JOIN inventory inv 
+                                    ON inv.station_id = v_station_id 
+                                   AND inv.product_id = req.product_id
+                                WHERE inv.stored_quantity IS NULL 
+                                   OR inv.stored_quantity < req.required_qty;
+
+                                IF v_shortage_count > 0 THEN
+                                    SIGNAL SQLSTATE '45000'
+                                    SET MESSAGE_TEXT = 'INSUFFICIENT_STOCK: Required inventory shortage or missing stock record at fulfillment station store';
+                                END IF;
+                            END IF;
+                        END;
+                    """)
+                    cur.execute("DROP TRIGGER IF EXISTS trg_deduct_inventory_on_delivery")
+                    cur.execute("""
+                        CREATE TRIGGER trg_deduct_inventory_on_delivery
+                        AFTER INSERT ON delivery
+                        FOR EACH ROW
+                        BEGIN
+                            DECLARE v_station_id INT;
+
+                            IF NEW.delivery_status <> 'CANCELLED' THEN
+                                SELECT dr.station_id INTO v_station_id
+                                FROM roster_assignment ra
+                                JOIN delivery_route dr ON dr.route_id = ra.route_id
+                                WHERE ra.roster_id = NEW.roster_id
+                                LIMIT 1;
+
+                                IF v_station_id IS NULL THEN
+                                    SELECT dr.station_id INTO v_station_id
+                                    FROM customer_order co
+                                    JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                                    WHERE co.order_id = NEW.order_id
+                                    LIMIT 1;
+                                END IF;
+
+                                IF v_station_id IS NOT NULL THEN
+                                    UPDATE inventory inv
+                                    JOIN (
+                                        SELECT product_id, SUM(quantity) AS required_qty
+                                        FROM order_item
+                                        WHERE order_id = NEW.order_id
+                                        GROUP BY product_id
+                                    ) req ON req.product_id = inv.product_id
+                                    SET inv.stored_quantity = inv.stored_quantity - req.required_qty
+                                    WHERE inv.station_id = v_station_id;
+                                END IF;
+                            END IF;
+                        END;
+                    """)
+                    cur.execute("DROP TRIGGER IF EXISTS trg_check_inventory_before_delivery_update")
+                    cur.execute("""
+                        CREATE TRIGGER trg_check_inventory_before_delivery_update
+                        BEFORE UPDATE ON delivery
+                        FOR EACH ROW
+                        BEGIN
+                            DECLARE v_station_id INT;
+                            DECLARE v_shortage_count INT DEFAULT 0;
+
+                            IF OLD.delivery_status = 'CANCELLED' AND NEW.delivery_status <> 'CANCELLED' THEN
+                                SELECT dr.station_id INTO v_station_id
+                                FROM roster_assignment ra
+                                JOIN delivery_route dr ON dr.route_id = ra.route_id
+                                WHERE ra.roster_id = NEW.roster_id
+                                LIMIT 1;
+
+                                IF v_station_id IS NULL THEN
+                                    SELECT dr.station_id INTO v_station_id
+                                    FROM customer_order co
+                                    JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                                    WHERE co.order_id = NEW.order_id
+                                    LIMIT 1;
+                                END IF;
+
+                                IF v_station_id IS NULL THEN
+                                    SIGNAL SQLSTATE '45000'
+                                    SET MESSAGE_TEXT = 'INSUFFICIENT_STOCK: Destination station store could not be resolved for delivery order';
+                                END IF;
+
+                                SELECT COUNT(*) INTO v_shortage_count
+                                FROM (
+                                    SELECT oi.product_id, SUM(oi.quantity) AS required_qty
+                                    FROM order_item oi
+                                    WHERE oi.order_id = NEW.order_id
+                                    GROUP BY oi.product_id
+                                ) req
+                                LEFT JOIN inventory inv 
+                                    ON inv.station_id = v_station_id 
+                                   AND inv.product_id = req.product_id
+                                WHERE inv.stored_quantity IS NULL 
+                                   OR inv.stored_quantity < req.required_qty;
+
+                                IF v_shortage_count > 0 THEN
+                                    SIGNAL SQLSTATE '45000'
+                                    SET MESSAGE_TEXT = 'INSUFFICIENT_STOCK: Required inventory shortage or missing stock record at fulfillment station store';
+                                END IF;
+                            END IF;
+                        END;
+                    """)
+                    cur.execute("DROP TRIGGER IF EXISTS trg_handle_inventory_on_delivery_status_change")
+                    cur.execute("""
+                        CREATE TRIGGER trg_handle_inventory_on_delivery_status_change
+                        AFTER UPDATE ON delivery
+                        FOR EACH ROW
+                        BEGIN
+                            DECLARE v_station_id INT;
+
+                            IF OLD.delivery_status <> 'CANCELLED' AND NEW.delivery_status = 'CANCELLED' THEN
+                                SELECT dr.station_id INTO v_station_id
+                                FROM roster_assignment ra
+                                JOIN delivery_route dr ON dr.route_id = ra.route_id
+                                WHERE ra.roster_id = OLD.roster_id
+                                LIMIT 1;
+
+                                IF v_station_id IS NULL THEN
+                                    SELECT dr.station_id INTO v_station_id
+                                    FROM customer_order co
+                                    JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                                    WHERE co.order_id = OLD.order_id
+                                    LIMIT 1;
+                                END IF;
+
+                                IF v_station_id IS NOT NULL THEN
+                                    UPDATE inventory inv
+                                    JOIN (
+                                        SELECT product_id, SUM(quantity) AS required_qty
+                                        FROM order_item
+                                        WHERE order_id = OLD.order_id
+                                        GROUP BY product_id
+                                    ) req ON req.product_id = inv.product_id
+                                    SET inv.stored_quantity = inv.stored_quantity + req.required_qty
+                                    WHERE inv.station_id = v_station_id;
+                                END IF;
+
+                            ELSEIF OLD.delivery_status = 'CANCELLED' AND NEW.delivery_status <> 'CANCELLED' THEN
+                                SELECT dr.station_id INTO v_station_id
+                                FROM roster_assignment ra
+                                JOIN delivery_route dr ON dr.route_id = ra.route_id
+                                WHERE ra.roster_id = NEW.roster_id
+                                LIMIT 1;
+
+                                IF v_station_id IS NULL THEN
+                                    SELECT dr.station_id INTO v_station_id
+                                    FROM customer_order co
+                                    JOIN delivery_route dr ON dr.route_id = co.delivery_route_id
+                                    WHERE co.order_id = NEW.order_id
+                                    LIMIT 1;
+                                END IF;
+
+                                IF v_station_id IS NOT NULL THEN
+                                    UPDATE inventory inv
+                                    JOIN (
+                                        SELECT product_id, SUM(quantity) AS required_qty
+                                        FROM order_item
+                                        WHERE order_id = NEW.order_id
+                                        GROUP BY product_id
+                                    ) req ON req.product_id = inv.product_id
+                                    SET inv.stored_quantity = inv.stored_quantity - req.required_qty
+                                    WHERE inv.station_id = v_station_id;
+                                END IF;
+                            END IF;
+                        END;
+                    """)
+                except Exception as trg_err:
+                    logger.warning(f"Error ensuring inventory triggers: {trg_err}")
+
 
                 # 5c. Ensure delivery table has cargo_weight_kg, assigned_at, assigned_by, active_order_id
                 cur.execute("SHOW TABLES LIKE 'delivery'")

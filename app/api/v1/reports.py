@@ -404,39 +404,57 @@ def get_rail_capacity_utilisation():
 @router.get("/workforce-hours")
 def get_workforce_hours():
     query = """
-        WITH weekly_hours AS (
+        WITH split_assignments AS (
+            -- Segments in the initial work week up to the Monday week boundary
+            SELECT 
+                ra.roster_id, ra.driver_id, ra.assistant_id,
+                YEARWEEK(ra.start_time, 1) AS work_week,
+                TIMESTAMPDIFF(MINUTE, ra.start_time, 
+                    LEAST(ra.end_time, TIMESTAMP(DATE_ADD(DATE(ra.start_time), INTERVAL (7 - WEEKDAY(ra.start_time)) DAY)))
+                ) / 60.0 AS duration_hours
+            FROM roster_assignment ra
+            WHERE ra.status <> 'CANCELLED'
+            
+            UNION ALL
+            
+            -- Segments that cross the Monday week boundary into the subsequent week
+            SELECT 
+                ra.roster_id, ra.driver_id, ra.assistant_id,
+                YEARWEEK(ra.end_time, 1) AS work_week,
+                TIMESTAMPDIFF(MINUTE, 
+                    TIMESTAMP(DATE_ADD(DATE(ra.start_time), INTERVAL (7 - WEEKDAY(ra.start_time)) DAY)),
+                    ra.end_time
+                ) / 60.0 AS duration_hours
+            FROM roster_assignment ra
+            WHERE ra.status <> 'CANCELLED'
+              AND YEARWEEK(ra.start_time, 1) <> YEARWEEK(ra.end_time, 1)
+        ),
+        weekly_hours AS (
             SELECT
                 ds.delivery_staff_id,
                 u.name AS staff_name,
                 u.role AS staff_role,
-                YEARWEEK(ra.start_time, 1) AS work_week,
-                SUM(
-                    TIMESTAMPDIFF(
-                        MINUTE,
-                        ra.start_time,
-                        ra.end_time
-                    )
-                ) / 60.0 AS accumulated_hours,
+                sa.work_week,
+                SUM(sa.duration_hours) AS accumulated_hours,
                 CASE
                     WHEN u.role = 'DRIVER' THEN 40.00
                     WHEN u.role = 'ASSISTANT' THEN 60.00
                 END AS weekly_cap
-            FROM roster_assignment ra
+            FROM split_assignments sa
             JOIN delivery_staff ds
                 ON (
-                    ra.driver_id = ds.delivery_staff_id
-                    OR ra.assistant_id = ds.delivery_staff_id
+                    sa.driver_id = ds.delivery_staff_id
+                    OR sa.assistant_id = ds.delivery_staff_id
                 )
             JOIN user u
                 ON ds.user_id = u.user_id
             WHERE
                 u.role IN ('DRIVER', 'ASSISTANT')
-                AND ra.status <> 'CANCELLED'
             GROUP BY
                 ds.delivery_staff_id,
                 u.name,
                 u.role,
-                YEARWEEK(ra.start_time, 1)
+                sa.work_week
         )
         SELECT
             delivery_staff_id,
@@ -601,3 +619,61 @@ def get_station_inventory_report():
             _execute_report_query(cursor, query)
             data = cursor.fetchall()
             return {"station_inventory": data}
+
+
+@router.get("/customer-order-history")
+def get_customer_order_history(limit: int = 100):
+    """Report 6: Customer Order History with Delivery Details (Project 3 Management Report #6)."""
+    query = """
+        SELECT
+            co.order_id,
+            c.customer_name,
+            co.order_date,
+            co.delivery_date,
+            co.status AS order_status,
+            dr.route_name,
+            tt.trip_id,
+            tt.departure_datetime,
+            tt.arrival_datetime,
+            ra.allocated_quantity,
+            ra.allocated_space,
+            ra.allocated_at,
+            m.status AS manifest_status,
+            m.received_at,
+            t.plate_number,
+            d.delivery_status,
+            d.delivered_at,
+            d.proof_reference
+        FROM customer_order co
+        JOIN customer c
+            ON co.customer_id = c.customer_id
+        LEFT JOIN delivery_route dr
+            ON co.delivery_route_id = dr.route_id
+        LEFT JOIN order_item oi
+            ON co.order_id = oi.order_id
+        LEFT JOIN rail_allocation ra
+            ON oi.order_item_id = ra.order_item_id
+        LEFT JOIN train_trip tt
+            ON ra.trip_id = tt.trip_id
+        LEFT JOIN manifest m
+            ON tt.trip_id = m.trip_id
+        LEFT JOIN delivery d
+            ON co.order_id = d.order_id
+        LEFT JOIN roster_assignment r
+            ON d.roster_id = r.roster_id
+        LEFT JOIN truck t
+            ON r.truck_id = t.truck_id
+        ORDER BY
+            co.order_id DESC,
+            tt.departure_datetime
+        LIMIT %s
+    """
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, (limit,))
+            rows = cursor.fetchall()
+            for r in rows:
+                for k in ["order_date", "delivery_date", "departure_datetime", "arrival_datetime", "allocated_at", "received_at", "delivered_at"]:
+                    if r.get(k):
+                        r[k] = str(r[k])
+            return {"customer_order_history": rows}

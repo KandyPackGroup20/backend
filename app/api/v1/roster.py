@@ -373,14 +373,53 @@ def complete_driver_delivery(
         with get_db() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT d.delivery_id, d.order_id, d.roster_id, d.delivery_status, co.customer_id
+                    SELECT d.delivery_id, d.order_id, d.roster_id, d.delivery_status,
+                           co.customer_id, co.status AS order_status,
+                           r.driver_id, r.assistant_id,
+                           u_driver.user_id AS driver_user_id,
+                           u_asst.user_id AS asst_user_id
                     FROM delivery d
                     JOIN customer_order co ON co.order_id = d.order_id
+                    LEFT JOIN roster_assignment r ON d.roster_id = r.roster_id
+                    LEFT JOIN delivery_staff ds_driver ON r.driver_id = ds_driver.delivery_staff_id
+                    LEFT JOIN `user` u_driver ON ds_driver.user_id = u_driver.user_id
+                    LEFT JOIN delivery_staff ds_asst ON r.assistant_id = ds_asst.delivery_staff_id
+                    LEFT JOIN `user` u_asst ON ds_asst.user_id = u_asst.user_id
                     WHERE d.delivery_id = %s
+                    FOR UPDATE
                 """, (delivery_id,))
                 deliv = cursor.fetchone()
                 if not deliv:
                     raise HTTPException(status_code=404, detail="Delivery record not found.")
+
+                if deliv["delivery_status"] in ("DELIVERED", "COMPLETED"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "DELIVERY_ALREADY_COMPLETED", "message": f"Delivery #{delivery_id} has already been marked as DELIVERED."}
+                    )
+                if deliv["delivery_status"] == "CANCELLED":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "DELIVERY_CANCELLED", "message": f"Delivery #{delivery_id} has been cancelled."}
+                    )
+                if deliv.get("order_status") in ("DELIVERED", "COMPLETED"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "ORDER_ALREADY_COMPLETED", "message": f"Order #{deliv['order_id']} is already completed."}
+                    )
+                if deliv.get("order_status") == "CANCELLED":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_code": "ORDER_CANCELLED", "message": f"Order #{deliv['order_id']} has been cancelled."}
+                    )
+
+                if current_user.get("role") in ("DRIVER", "ASSISTANT"):
+                    assigned_uids = [uid for uid in (deliv.get("driver_user_id"), deliv.get("asst_user_id")) if uid is not None]
+                    if current_user.get("user_id") not in assigned_uids:
+                        raise HTTPException(
+                            status_code=403,
+                            detail={"error_code": "UNAUTHORIZED_STAFF", "message": "FORBIDDEN: You are not assigned to this delivery's roster run."}
+                        )
 
                 now = datetime.now()
                 cursor.execute("""

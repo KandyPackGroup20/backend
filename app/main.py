@@ -2,10 +2,11 @@ import os
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
+from app.core.security import require_roles
 from app.api.v1 import auth, rail, roster, reports, notifications, orders, inventory
 from app.core.notifications import ensure_notification_table
 from app.core.migrations import run_migrations
@@ -108,11 +109,11 @@ def health_check():
     }
 
 @app.get("/migrate")
-def trigger_migrate():
-    if os.getenv("RUN_STARTUP_MIGRATIONS", "true").lower() != "true":
+def trigger_migrate(current_user: dict = Depends(require_roles(["SUPERADMIN"]))):
+    if os.getenv("ALLOW_MANUAL_MIGRATE_ENDPOINT", "false").lower() != "true":
         return JSONResponse(
             status_code=404,
-            content={"detail": "Not Found"},
+            content={"detail": "Manual migration endpoint is disabled."},
         )
     from app.core.migrations import run_migrations
     from app.core.cache import reset_login_failures
@@ -131,8 +132,8 @@ def trigger_migrate():
 
 
 @app.api_route("/api/v1/auth/purge-test-user", methods=["GET", "POST", "DELETE"])
-def purge_test_user(email: str):
-    """Purges any user account from the cloud MySQL database to allow clean resets and re-testing."""
+def purge_test_user(email: str, current_user: dict = Depends(require_roles(["SUPERADMIN"]))):
+    """Purges any user account from the cloud MySQL database. Restricted to authenticated SuperAdmin."""
     clean_email = email.strip().lower()
     if clean_email == "admin@kandypack.lk":
         return JSONResponse(

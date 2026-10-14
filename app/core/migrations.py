@@ -1830,6 +1830,18 @@ def run_migrations():
                     except Exception as sp_err:
                         logger.warning(f"Error redefining sp_receive_manifest: {sp_err}")
 
+                    try:
+                        cur.execute("""
+                            ALTER TABLE stock_adjustment 
+                                MODIFY COLUMN station_id INT NULL,
+                                MODIFY COLUMN product_id INT NULL,
+                                MODIFY COLUMN quantity_adjusted INT NULL DEFAULT 0;
+                        """)
+                        conn.commit()
+                        logger.info("[DATABASE AUTO-MIGRATION] stock_adjustment schema updated for flexible adjustments.")
+                    except Exception as sa_err:
+                        logger.warning(f"[DATABASE AUTO-MIGRATION] Note on stock_adjustment alter: {sa_err}")
+
                     conn.commit()
                     logger.info("[DATABASE AUTO-MIGRATION] Regional station assignments and staff verified.")
                 except Exception as reg_err:

@@ -297,11 +297,42 @@ def create_stock_adjustment(
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            # 1. Resolve inventory row, station_id, and product_id
+            cursor.execute(
+                "SELECT station_id, product_id, stored_quantity FROM inventory WHERE inventory_id = %s",
+                (payload.inventory_id,)
+            )
+            inv_row = cursor.fetchone()
+            if not inv_row:
+                raise HTTPException(status_code=404, detail=f"Inventory item #{payload.inventory_id} not found.")
+
+            assigned_station = _get_user_assigned_station_id(current_user, conn)
+            station_id = inv_row.get("station_id") or assigned_station or 1
+            product_id = inv_row.get("product_id") or 1
+            actor_id = current_user.get("user_id")
+
+            # Validate stock cannot drop below zero
+            if payload.quantity_delta < 0 and (inv_row["stored_quantity"] + payload.quantity_delta) < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot reduce stock by {abs(payload.quantity_delta)}. Current stored quantity is only {inv_row['stored_quantity']}. Negative warehouse stock is prohibited."
+                )
+
             try:
                 cursor.execute(
-                    """INSERT INTO stock_adjustment (inventory_id, quantity_delta, reason, adjusted_by)
-                       VALUES (%s, %s, %s, %s)""",
-                    (payload.inventory_id, payload.quantity_delta, payload.reason, current_user["user_id"])
+                    """INSERT INTO stock_adjustment 
+                       (inventory_id, station_id, product_id, quantity_delta, quantity_adjusted, reason, reported_by, adjusted_by)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        payload.inventory_id,
+                        station_id,
+                        product_id,
+                        payload.quantity_delta,
+                        payload.quantity_delta,
+                        payload.reason,
+                        actor_id,
+                        actor_id
+                    )
                 )
                 conn.commit()
             except pymysql.err.MySQLError as e:

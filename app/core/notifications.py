@@ -147,7 +147,7 @@ def _perform_live_dispatch(
                 headers={"Content-Type": "application/json", "User-Agent": "KandyPack-Backend/2.0"},
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status in (200, 201):
                     delivered_live = True
                     entry["status"] = "DELIVERED"
@@ -179,7 +179,7 @@ def _perform_live_dispatch(
             msg.attach(MIMEText(text_content, "plain"))
             msg.attach(MIMEText(final_html, "html"))
 
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=4) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
                 server.starttls()
                 server.login(smtp_user, smtp_pass)
                 server.sendmail(smtp_user, [target_email], msg.as_string())
@@ -216,7 +216,7 @@ def _perform_live_dispatch(
                         "https://api.resend.com/emails",
                         json=payload,
                         headers=headers,
-                        timeout=4.0
+                        timeout=10.0
                     )
                     if resp.status_code in (200, 201):
                         return resp.json().get("id")
